@@ -1,11 +1,12 @@
 // Plugin of the AI companion mod for Skyrim (KI_MCP_Gefaehrte.esp).
 // It reads what Papyrus scripts cannot get at and hands it to the script KI_MCP_Gefaehrte_Native.
-// So far: the open quests of the player with the texts of their objectives,
+// So far: the open quests of the player with the texts of their objectives and where their targets are,
+// the places around the player (map markers and doors that lead somewhere),
 // and what the characters around the player say (the subtitles of the game).
 //
 // The project layout and the places of the subtitle hook come from mikastamm/mantella-vanilla-dialogue (MIT license),
 // the build setup from Racvb0.
-// The quests are only read. For the subtitles the plugin hooks into two calls of the game (see InstallSubtitleHook).
+// Quests and places are only read. For the subtitles the plugin hooks into two calls of the game (see InstallSubtitleHook).
 
 #include <algorithm>
 #include <array>
@@ -18,9 +19,11 @@
 #include <format>
 #include <fstream>
 #include <mutex>
+#include <numbers>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "PCH.h"
@@ -29,7 +32,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 2;
+    constexpr std::int32_t INTERFACE_VERSION = 3;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -70,6 +73,44 @@ namespace Companion {
     // Each redirected call needs 14 bytes of the trampoline
     constexpr std::size_t TRAMPOLINE_BYTES = 64;
     constexpr std::string_view UNKNOWN_VALUE = "?";
+
+    // Distances go to the script in meters. One meter is about 70 game units
+    constexpr float GAME_UNITS_PER_METER = 70.0f;
+    constexpr float DEGREES_PER_RADIAN = 180.0f / std::numbers::pi_v<float>;
+    constexpr float FULL_CIRCLE_DEGREES = 360.0f;
+    // A small worldspace (eg a walled city) can lie inside a bigger one and share its coordinates. This many steps up are followed
+    constexpr std::size_t MAX_WORLD_PARENTS = 4;
+
+    // Targets of quests: how many targets of one objective are looked at and how many of them are handed out
+    constexpr std::size_t MAX_CHECKED_TARGETS = 16;
+    constexpr std::size_t MAX_TARGETS_PER_OBJECTIVE = 3;
+    constexpr std::size_t DEFAULT_MAX_QUEST_TARGETS = 12;
+    // The game keeps the doors on the way to a target in a list. A longer list than this is taken for broken data
+    constexpr std::size_t MAX_DOORS_ON_THE_WAY = 32;
+    // Everything the game has an ID for starts the same way, and the ID stands within these first bytes
+    constexpr std::size_t FORM_START_BYTES = 0x20;
+    // Where a target is: in the same area as the player, behind a door of this area, or somewhere else
+    constexpr std::int32_t TARGET_IS_HERE = 0;
+    constexpr std::int32_t TARGET_IS_BEHIND_DOOR = 1;
+    constexpr std::int32_t TARGET_IS_ELSEWHERE = 2;
+
+    // Places: kinds of lines, and the limits if the script names none
+    constexpr std::int32_t PLACE_IS_MAP_MARKER = 0;
+    constexpr std::int32_t PLACE_IS_DOOR = 1;
+    constexpr std::int32_t DEFAULT_PLACE_RADIUS_METERS = 300;
+    constexpr std::size_t DEFAULT_MAX_MAP_MARKERS = 8;
+    constexpr std::size_t DEFAULT_MAX_DOORS = 8;
+    // What the script learns about a map marker: whether the player has been there (can travel to it)
+    constexpr std::int32_t MARKER_IS_KNOWN = 1;
+
+    // Functions of the game this plugin calls through the Address Library, by their IDs for Skyrim SE (which Skyrim VR shares).
+    // The Address Library for Skyrim VR is a file that grows from release to release, and an ID it does not have
+    // ends the game with an error. So the plugin looks into the file first (see HasGameAddress)
+    constexpr std::uint64_t CONDITION_IS_TRUE_ID = 29074;
+    constexpr std::uint64_t WORLD_SINGLETON_ID = 516923;
+    // The file name is these two parts around the version of the game, eg "1-4-15-0"
+    constexpr std::string_view ADDRESS_FILE_START = "Data/SKSE/Plugins/version-";
+    constexpr std::string_view ADDRESS_FILE_END = ".csv";
 
     // ------------------------------------------------------------------ texts
 
@@ -292,6 +333,8 @@ namespace Companion {
     struct OpenQuest {
         const RE::TESQuest* quest = nullptr;
         std::vector<std::string> objectives;
+        // The objectives behind the texts above, in the same order
+        std::vector<const RE::BGSQuestObjective*> objectiveForms;
     };
 
     // The list behind the journal: every objective the player has ever been shown, with its state.
@@ -344,12 +387,320 @@ namespace Companion {
                 known = placeOfQuest.emplace(quest, quests.size()).first;
                 quests.push_back(std::move(added));
             }
-            auto& objectives = quests[known->second].objectives;
-            if (objectives.size() < MAX_OBJECTIVES_PER_QUEST) objectives.push_back(std::move(text));
+            auto& openQuest = quests[known->second];
+            if (openQuest.objectives.size() < MAX_OBJECTIVES_PER_QUEST) {
+                openQuest.objectives.push_back(std::move(text));
+                openQuest.objectiveForms.push_back(objective);
+            }
         }
 
         std::stable_partition(quests.begin(), quests.end(), [](const OpenQuest& entry) { return entry.quest->IsActive(); });
         return quests;
+    }
+
+    // -------------------------------------------------------------- positions
+    // Where something is, seen from the player: how far away, and at which angle from where the player faces.
+    // The companion server works out the same for the companion (src/companion/game_state.py in the Mantella fork)
+
+    // Whether the Address Library of this game has the function with this ID. Only Skyrim VR can lack one
+    bool HasGameAddress(std::uint64_t wantedID) {
+        if (!REL::Module::IsVR()) return true;
+        static std::unordered_set<std::uint64_t> knownIDs;
+        static bool isRead = false;
+        if (!isRead) {
+            isRead = true;
+            const std::string fileName = std::string(ADDRESS_FILE_START) + REL::Module::get().version().string() + std::string(ADDRESS_FILE_END);
+            std::ifstream file(fileName);
+            std::string line;
+            // One line per function: its ID, a comma and its place in the game. The first two lines are headings
+            while (std::getline(file, line)) {
+                std::uint64_t number = 0;
+                std::size_t index = 0;
+                while (index < line.size() && line[index] >= '0' && line[index] <= '9') {
+                    number = number * 10 + static_cast<std::uint64_t>(line[index] - '0');
+                    ++index;
+                }
+                if (index > 0 && index < line.size() && line[index] == ',') knownIDs.insert(number);
+            }
+            logger::info("Address Library {}: {} IDs read.", fileName, knownIDs.size());
+        }
+        return knownIDs.contains(wantedID);
+    }
+
+    struct View {
+        std::int32_t distanceMeters = 0;
+        // Negative = to the left of where the player faces, positive = to the right
+        std::int32_t angleDegrees = 0;
+    };
+
+    View GetViewFromPlayer(const RE::PlayerCharacter* player, const RE::NiPoint3& point) {
+        const auto own = player->GetPosition();
+        const float east = point.x - own.x;
+        const float north = point.y - own.y;
+        const float up = point.z - own.z;
+        // The game counts directions clockwise from north, like a compass
+        const float direction = std::atan2(east, north) * DEGREES_PER_RADIAN;
+        const float facing = player->GetAngleZ() * DEGREES_PER_RADIAN;
+        View view;
+        view.distanceMeters = static_cast<std::int32_t>(std::lround(std::sqrt(east * east + north * north + up * up) / GAME_UNITS_PER_METER));
+        view.angleDegrees = static_cast<std::int32_t>(std::lround(std::remainder(direction - facing, FULL_CIRCLE_DEGREES)));
+        return view;
+    }
+
+    // The cell a reference is in. The game keeps it elsewhere for a reference whose cell is not loaded
+    const RE::TESObjectCELL* GetCellOf(const RE::TESObjectREFR* reference) {
+        if (!reference) return nullptr;
+        const auto* cell = reference->GetParentCell();
+        return cell ? cell : reference->GetSaveParentCell();
+    }
+
+    // The worldspace whose coordinates an outdoor cell uses: its own, or the bigger one it lies in (Whiterun lies in Skyrim)
+    const RE::TESWorldSpace* GetRootWorldOf(const RE::TESObjectCELL* cell) {
+        if (!cell || !cell->IsExteriorCell()) return nullptr;
+        const auto* world = cell->GetRuntimeData().worldSpace;
+        for (std::size_t step = 0; step < MAX_WORLD_PARENTS; ++step) {
+            if (!world || !world->parentWorld) break;
+            if (!world->parentUseFlags.any(RE::TESWorldSpace::ParentUseFlag::kUseLandData)) break;
+            world = world->parentWorld;
+        }
+        return world;
+    }
+
+    // Only then a distance and a direction between two positions mean anything
+    bool IsSameSpace(const RE::TESObjectCELL* left, const RE::TESObjectCELL* right) {
+        if (!left || !right) return false;
+        if (left == right) return true;
+        if (left->IsInteriorCell() || right->IsInteriorCell()) return false;
+        const auto* leftWorld = GetRootWorldOf(left);
+        return leftWorld && leftWorld == GetRootWorldOf(right);
+    }
+
+    // The name the game shows for a place: the name of the indoor cell, or outdoors the name of the worldspace
+    std::string GetNameOfCell(const RE::TESObjectCELL* cell) {
+        if (!cell) return std::string();
+        if (cell->IsInteriorCell()) return CleanText(ViewOf(cell->GetFullName()));
+        const auto* world = cell->GetRuntimeData().worldSpace;
+        return world ? CleanText(ViewOf(world->GetFullName())) : std::string();
+    }
+
+    // Where a door leads that loads another area, or an empty text if it is no such door or the game has no name for the place.
+    // It is the name the game shows when the player looks at the door
+    std::string GetNameBehindDoor(const RE::TESObjectREFR* door) {
+        const auto* teleport = door->extraList.GetByType<RE::ExtraTeleport>();
+        const auto* link = teleport ? teleport->teleportData : nullptr;
+        if (!link) return std::string();
+        const auto otherDoor = link->linkedDoor.get();
+        if (!otherDoor) return std::string();
+        return GetNameOfCell(GetCellOf(otherDoor.get()));
+    }
+
+    // Whether these bytes of memory can be read without an error
+    bool IsReadableMemory(const void* address, std::size_t length) {
+        if (!address) return false;
+        MEMORY_BASIC_INFORMATION information{};
+        if (VirtualQuery(address, &information, sizeof(information)) == 0) return false;
+        if (information.State != MEM_COMMIT) return false;
+        if ((information.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+        const auto regionEnd = reinterpret_cast<std::uintptr_t>(information.BaseAddress) + information.RegionSize;
+        return reinterpret_cast<std::uintptr_t>(address) + length <= regionEnd;
+    }
+
+    // Whether the pointer really leads to something the game knows (a character, a door, a topic ...). For pointers out of
+    // data whose layout is not confirmed for every version of the game: nothing is used before the game itself
+    // has named the same object for the ID that stands at the start of it
+    bool IsKnownForm(const RE::TESForm* candidate) {
+        if (!IsReadableMemory(candidate, FORM_START_BYTES)) return false;
+        return RE::TESForm::LookupByID(candidate->GetFormID()) == candidate;
+    }
+
+    // ---------------------------------------------------------- quest targets
+    // An objective can have targets: the characters, things or places the compass of the game points to.
+    // A target names an alias of its quest, and it can have conditions that say whether it counts at the moment.
+    // If a target is in another area, the game keeps the doors on the way to it with the target (TESQuestTarget::teleportPath)
+
+    struct QuestTarget {
+        std::int32_t kind = TARGET_IS_ELSEWHERE;
+        View view;
+        std::string name;
+        std::string place;
+    };
+
+    // The first door on the way to the target that is in the area of the player, or nullptr
+    const RE::TESObjectREFR* FindDoorOnTheWay(const RE::TESQuestTarget* target, const RE::TESObjectCELL* playerCell) {
+        const auto& doors = target->teleportPath.teleportRefs;
+        if (doors.empty() || doors.size() > MAX_DOORS_ON_THE_WAY || doors.size() > doors.capacity()) return nullptr;
+        if (!IsReadableMemory(doors.data(), doors.size() * sizeof(RE::TeleportPath::TeleportLink))) return nullptr;
+        for (const auto& door : doors) {
+            if (!IsKnownForm(door.ref)) continue;
+            if (IsSameSpace(playerCell, GetCellOf(door.ref))) return door.ref;
+        }
+        return nullptr;
+    }
+
+    // A door in the loaded area around the player that leads straight into this cell, the nearest one, or nullptr.
+    // For targets inside a building of the town the player stands in, if the game has no way to the target at hand
+    const RE::TESObjectREFR* FindLoadedDoorInto(const RE::TESObjectCELL* targetCell, RE::PlayerCharacter* player) {
+        if (!targetCell || !targetCell->IsInteriorCell() || !HasGameAddress(WORLD_SINGLETON_ID)) return nullptr;
+        auto* world = RE::TES::GetSingleton();
+        if (!world) return nullptr;
+        const auto own = player->GetPosition();
+        const RE::TESObjectREFR* nearestDoor = nullptr;
+        float nearestDistance = 0.0f;
+
+        world->ForEachReferenceInRange(player, static_cast<float>(DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
+            const auto* base = reference->GetBaseObject();
+            if (!base || !base->Is(RE::FormType::Door)) return RE::BSContainer::ForEachResult::kContinue;
+            const auto* teleport = reference->extraList.GetByType<RE::ExtraTeleport>();
+            const auto* link = teleport ? teleport->teleportData : nullptr;
+            if (!link) return RE::BSContainer::ForEachResult::kContinue;
+            const auto otherDoor = link->linkedDoor.get();
+            if (!otherDoor || GetCellOf(otherDoor.get()) != targetCell) return RE::BSContainer::ForEachResult::kContinue;
+            const float distance = own.GetDistance(reference->GetPosition());
+            if (!nearestDoor || distance < nearestDistance) {
+                nearestDoor = reference;
+                nearestDistance = distance;
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        return nearestDoor;
+    }
+
+    // The targets of one objective that count at the moment, at most MAX_TARGETS_PER_OBJECTIVE
+    std::vector<QuestTarget> CollectTargets(const RE::TESQuest* quest, const RE::BGSQuestObjective* objective, RE::PlayerCharacter* player,
+                                            bool canCheckConditions) {
+        std::vector<QuestTarget> targets;
+        if (!objective->targets) return targets;
+        const auto* playerCell = GetCellOf(player);
+        const std::size_t count = std::min<std::size_t>(objective->numTargets, MAX_CHECKED_TARGETS);
+        std::vector<const RE::TESObjectREFR*> seen;
+
+        for (std::size_t index = 0; index < count && targets.size() < MAX_TARGETS_PER_OBJECTIVE; ++index) {
+            const auto* target = objective->targets[index];
+            if (!target) continue;
+            const auto reference = quest->GetAliasedRef(target->alias).get();
+            if (!reference || reference->IsDisabled()) continue;
+            if (std::find(seen.begin(), seen.end(), reference.get()) != seen.end()) continue;
+            seen.push_back(reference.get());
+            // The conditions are asked about the target itself. A target without conditions always counts
+            if (canCheckConditions && target->conditions.head && !target->conditions.IsTrue(reference.get(), player)) continue;
+
+            QuestTarget found;
+            found.name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            const auto* targetCell = GetCellOf(reference.get());
+            if (IsSameSpace(playerCell, targetCell)) {
+                found.kind = TARGET_IS_HERE;
+                found.view = GetViewFromPlayer(player, reference->GetPosition());
+            } else {
+                // First the way the game itself has worked out, then a door that leads straight to where the target is
+                const auto* door = FindDoorOnTheWay(target, playerCell);
+                if (!door) door = FindLoadedDoorInto(targetCell, player);
+                if (door) {
+                    found.kind = TARGET_IS_BEHIND_DOOR;
+                    found.view = GetViewFromPlayer(player, door->GetPosition());
+                    found.place = GetNameBehindDoor(door);
+                } else {
+                    found.kind = TARGET_IS_ELSEWHERE;
+                    found.place = GetNameOfCell(targetCell);
+                }
+            }
+            targets.push_back(std::move(found));
+        }
+        return targets;
+    }
+
+    // ----------------------------------------------------------------- places
+    // What helps to say where the player is: the markers of the map (farms, mills, towers, caves ...) and,
+    // because a town has hardly any markers inside its walls, the doors that lead into buildings
+
+    struct Place {
+        std::int32_t kind = PLACE_IS_MAP_MARKER;
+        float distance = 0.0f;
+        View view;
+        // For a map marker: the kind of place as the game numbers it (RE::MARKER_TYPE), and MARKER_IS_KNOWN or 0
+        std::int32_t type = 0;
+        std::int32_t flags = 0;
+        std::string name;
+    };
+
+    // Keeps the nearest places, nearest first, and of two places with the same name the nearer one
+    void KeepNearest(std::vector<Place>& places, std::size_t limit) {
+        std::sort(places.begin(), places.end(), [](const Place& left, const Place& right) { return left.distance < right.distance; });
+        std::vector<Place> kept;
+        for (auto& place : places) {
+            if (kept.size() >= limit) break;
+            const bool isKnownName = std::any_of(kept.begin(), kept.end(), [&](const Place& other) { return other.name == place.name; });
+            if (!isKnownName) kept.push_back(std::move(place));
+        }
+        places = std::move(kept);
+    }
+
+    // The list of all map markers the game keeps with the player.
+    // Skyrim VR keeps it at another place of the player than the other versions of the game
+    const RE::BSTArray<RE::ObjectRefHandle>* GetMapMarkers(RE::PlayerCharacter* player) {
+        if (REL::Module::IsVR()) {
+            auto* virtualRealityData = player->GetVRPlayerRuntimeData();
+            return virtualRealityData ? &virtualRealityData->currentMapMarkers : nullptr;
+        }
+        return &player->GetPlayerRuntimeData().currentMapMarkers;
+    }
+
+    std::vector<Place> CollectMapMarkers(RE::PlayerCharacter* player, float radius, std::size_t limit) {
+        std::vector<Place> places;
+        const auto* playerCell = GetCellOf(player);
+        const auto* markers = GetMapMarkers(player);
+        // Indoors the map of the world outside says nothing about what is near
+        if (!markers || !playerCell || playerCell->IsInteriorCell()) return places;
+        const auto own = player->GetPosition();
+
+        for (const auto& handle : *markers) {
+            const auto marker = handle.get();
+            if (!marker || marker->IsDisabled()) continue;
+            const float distance = own.GetDistance(marker->GetPosition());
+            if (distance > radius) continue;
+            const auto* extra = marker->extraList.GetByType<RE::ExtraMapMarker>();
+            const auto* data = extra ? extra->mapData : nullptr;
+            if (!data || !IsSameSpace(playerCell, GetCellOf(marker.get()))) continue;
+
+            Place place;
+            place.kind = PLACE_IS_MAP_MARKER;
+            place.name = CleanText(ViewOf(data->locationName.GetFullName()));
+            if (place.name.empty()) continue;
+            place.distance = distance;
+            place.view = GetViewFromPlayer(player, marker->GetPosition());
+            place.type = static_cast<std::int32_t>(data->type.underlying());
+            place.flags = data->flags.any(RE::MapMarkerData::Flag::kCanTravelTo) ? MARKER_IS_KNOWN : 0;
+            places.push_back(std::move(place));
+        }
+        KeepNearest(places, limit);
+        return places;
+    }
+
+    // The doors in the loaded area around the player that lead into another area (a building, a cave, out of town)
+    std::vector<Place> CollectDoors(RE::PlayerCharacter* player, float radius, std::size_t limit) {
+        std::vector<Place> places;
+        if (!HasGameAddress(WORLD_SINGLETON_ID)) return places;
+        auto* world = RE::TES::GetSingleton();
+        if (!world) return places;
+        const auto own = player->GetPosition();
+
+        world->ForEachReferenceInRange(player, radius, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
+            const auto* base = reference->GetBaseObject();
+            if (!base || !base->Is(RE::FormType::Door)) return RE::BSContainer::ForEachResult::kContinue;
+            std::string name = GetNameBehindDoor(reference);
+            if (name.empty()) return RE::BSContainer::ForEachResult::kContinue;
+
+            Place place;
+            place.kind = PLACE_IS_DOOR;
+            place.name = std::move(name);
+            place.distance = own.GetDistance(reference->GetPosition());
+            place.view = GetViewFromPlayer(player, reference->GetPosition());
+            places.push_back(std::move(place));
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        KeepNearest(places, limit);
+        return places;
     }
 
     // ---------------------------------------------------------------- hearing
@@ -402,6 +753,14 @@ namespace Companion {
         if (!choice) return;
         const auto text = ViewOf(choice->topicText.c_str());
         if (text.empty()) return;
+        // When the player addresses a character, nothing has been picked yet. What stands here then is the greeting
+        // of the character, and its text is only the internal name of that topic (eg "DialogueGenericHello")
+        const auto* topicInfo = choice->parentTopicInfo;
+        const auto* topic = IsKnownForm(topicInfo) ? topicInfo->parentTopic : nullptr;
+        if (IsKnownForm(topic)) {
+            if (topic->data.subtype == RE::DIALOGUE_DATA::Subtype::kHello) return;
+            if (EqualsIgnoreCase(ViewOf(topic->GetFormEditorID()), text)) return;
+        }
         {
             const std::lock_guard<std::mutex> guard(heardLock);
             if (choice == lastChoice && text == lastChoiceText) return;
@@ -568,11 +927,100 @@ namespace Companion {
         return lines;
     }
 
+    // Whether the plugin can ask the game about the conditions of quest targets. Without that, GetQuestTargets
+    // hands out every target of an objective, also those the game itself would not show at the moment
+    bool canCheckTargetConditions = false;
+
+    // Where the targets of the tracked quests are, at most maxTargets. One text per target, its parts separated by tabs:
+    // place of the quest in the list GetOpenQuests(maxQuests) returns (from 0), place of the objective in that quest (from 0),
+    // where the target is (0 = in the area of the player, 1 = behind a door of this area, 2 = somewhere else),
+    // distance to the player in meters and angle from where the player faces in degrees (negative = left) - for 1 these are
+    // the distance and angle of that door, for 2 both are 0 -, name of the target (can be empty),
+    // and for 1 and 2 the name of the place behind the door or of the place the target is in (can be empty)
+    std::vector<std::string> GetQuestTargets(RE::StaticFunctionTag*, std::int32_t maxQuests, std::int32_t maxTargets) {
+        std::vector<std::string> lines;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return lines;
+        const auto quests = CollectOpenQuests();
+        const std::size_t questLimit = maxQuests > 0 ? static_cast<std::size_t>(maxQuests) : DEFAULT_MAX_QUESTS;
+        const std::size_t targetLimit = maxTargets > 0 ? static_cast<std::size_t>(maxTargets) : DEFAULT_MAX_QUEST_TARGETS;
+
+        for (std::size_t questIndex = 0; questIndex < quests.size() && questIndex < questLimit; ++questIndex) {
+            const auto& entry = quests[questIndex];
+            // The compass of the game only shows the targets of tracked quests, and so does this list
+            if (!entry.quest->IsActive()) continue;
+            for (std::size_t objectiveIndex = 0; objectiveIndex < entry.objectiveForms.size(); ++objectiveIndex) {
+                const auto targets = CollectTargets(entry.quest, entry.objectiveForms[objectiveIndex], player, canCheckTargetConditions);
+                for (const auto& target : targets) {
+                    if (lines.size() >= targetLimit) return lines;
+                    std::string line = std::to_string(questIndex);
+                    line += FIELD_SEPARATOR;
+                    line += std::to_string(objectiveIndex);
+                    line += FIELD_SEPARATOR;
+                    line += std::to_string(target.kind);
+                    line += FIELD_SEPARATOR;
+                    line += std::to_string(target.view.distanceMeters);
+                    line += FIELD_SEPARATOR;
+                    line += std::to_string(target.view.angleDegrees);
+                    line += FIELD_SEPARATOR;
+                    line += target.name;
+                    line += FIELD_SEPARATOR;
+                    line += target.place;
+                    lines.push_back(std::move(line));
+                }
+            }
+        }
+        logger::debug("GetQuestTargets: {} targets sent", lines.size());
+        return lines;
+    }
+
+    // The places around the player, map markers first, then doors, each nearest first:
+    // at most maxMarkers map markers within radiusMeters (none indoors), and at most maxDoors doors in the loaded area
+    // within radiusMeters that lead into another area. One text per place, its parts separated by tabs:
+    // kind (0 = map marker, 1 = door), distance to the player in meters, angle from where the player faces in degrees
+    // (negative = left), for a map marker the kind of place as the game numbers it (13 = farm, 21 = stable ...; 0 for a door),
+    // for a map marker 1 if the player has been there (0 otherwise, and for a door),
+    // name of the place, for a door the name of the place it leads to
+    std::vector<std::string> GetNearbyPlaces(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxMarkers, std::int32_t maxDoors) {
+        std::vector<std::string> lines;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return lines;
+        const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER;
+        // A limit of 0 switches that kind of place off, a negative one means: the usual number
+        const std::size_t markerLimit = maxMarkers >= 0 ? static_cast<std::size_t>(maxMarkers) : DEFAULT_MAX_MAP_MARKERS;
+        const std::size_t doorLimit = maxDoors >= 0 ? static_cast<std::size_t>(maxDoors) : DEFAULT_MAX_DOORS;
+
+        std::vector<Place> places;
+        if (markerLimit > 0) places = CollectMapMarkers(player, radius, markerLimit);
+        if (doorLimit > 0) {
+            auto doors = CollectDoors(player, radius, doorLimit);
+            for (auto& door : doors) places.push_back(std::move(door));
+        }
+        for (const auto& place : places) {
+            std::string line = std::to_string(place.kind);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(place.view.distanceMeters);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(place.view.angleDegrees);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(place.type);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(place.flags);
+            line += FIELD_SEPARATOR;
+            line += place.name;
+            lines.push_back(std::move(line));
+        }
+        logger::debug("GetNearbyPlaces: {} places sent", lines.size());
+        return lines;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
         vm->RegisterFunction("IsHearing", SCRIPT_NAME, IsHearing);
         vm->RegisterFunction("TakeHeardLines", SCRIPT_NAME, TakeHeardLines);
+        vm->RegisterFunction("GetQuestTargets", SCRIPT_NAME, GetQuestTargets);
+        vm->RegisterFunction("GetNearbyPlaces", SCRIPT_NAME, GetNearbyPlaces);
         return true;
     }
 
@@ -585,6 +1033,14 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     logger::info("Loaded. Functions for the script {} registered, interface version {}.", Companion::SCRIPT_NAME,
                  Companion::INTERFACE_VERSION);
     Companion::isHearing = Companion::InstallSubtitleHook();
+    Companion::canCheckTargetConditions = Companion::HasGameAddress(Companion::CONDITION_IS_TRUE_ID);
+    if (!Companion::canCheckTargetConditions) {
+        logger::warn("The Address Library has no ID {}: quest targets are handed out without checking their conditions.",
+                     Companion::CONDITION_IS_TRUE_ID);
+    }
+    if (!Companion::HasGameAddress(Companion::WORLD_SINGLETON_ID)) {
+        logger::warn("The Address Library has no ID {}: no doors among the places.", Companion::WORLD_SINGLETON_ID);
+    }
     if (const auto* messaging = SKSE::GetMessagingInterface()) {
         messaging->RegisterListener("SKSE", Companion::OnMessage);
     }
