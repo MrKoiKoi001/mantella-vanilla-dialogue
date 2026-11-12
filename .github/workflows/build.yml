@@ -1,4 +1,4 @@
-name: Compilar MantellaDialogue.dll
+name: Build KI_MCP_Gefaehrte.dll
 
 on:
   push:
@@ -59,9 +59,9 @@ jobs:
         id: find_dll
         shell: pwsh
         run: |
-          $dll = Get-ChildItem -Path build -Recurse -Filter "MantellaDialogue.dll" | Select-Object -First 1
+          $dll = Get-ChildItem -Path build -Recurse -Filter "KI_MCP_Gefaehrte.dll" | Select-Object -First 1
           if (-not $dll) {
-            Write-Error "No se encontró MantellaDialogue.dll en build/"
+            Write-Error "No se encontró KI_MCP_Gefaehrte.dll en build/"
             exit 1
           }
           Write-Host "DLL: $($dll.FullName)"
@@ -71,7 +71,7 @@ jobs:
       - name: Subir artefacto
         uses: actions/upload-artifact@v4
         with:
-          name: MantellaDialogue.dll
+          name: KI_MCP_Gefaehrte.dll
           # Glob independiente del paso anterior: si el output quedara vacío, la
           # subida igual funciona.
-          path: build/**/MantellaDialogue.dll
+          path: build/**/KI_MCP_Gefaehrte.dll

@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.21)
 # Puedes cambiar Release/Debug aquí o usar cmake --build build --config <perfil>
 # set(CMAKE_CONFIGURATION_TYPES "Release;Debug" CACHE STRING "" FORCE)
 
-project(MantellaDialogue VERSION 0.0.1 LANGUAGES CXX)
+project(KI_MCP_Gefaehrte VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,7 +35,7 @@ target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23) # <--- use C++23 sta
 # windows.h define macros min/max que rompen std::min/std::max (error C2589).
 target_compile_definitions(${PROJECT_NAME} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_precompile_headers(${PROJECT_NAME} PRIVATE PCH.h) # <--- PCH.h is required!
-set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_FILENAME "MantellaDialogue") # <--- the plugin name
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_FILENAME "KI_MCP_Gefaehrte") # <--- the plugin name
 
 # ---- Compilación ----
 # El .dll aparece en build/<project>/ ó en SKYRIM_MODS_FOLDER si está definido.

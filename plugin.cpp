@@ -1,523 +1,360 @@
-#include <cstdint>  // For fixed-width integer types
-#include <map>      // For std::map
-#include <set>      // For std::set
-#include <string>   // For std::string
-#include <vector>   // For std::vector
+// Plugin of the AI companion mod for Skyrim (KI_MCP_Gefaehrte.esp).
+// It reads what Papyrus scripts cannot get at and hands it to the script KI_MCP_Gefaehrte_Native.
+// So far: the open quests of the player with the texts of their objectives.
+//
+// The project layout comes from mikastamm/mantella-vanilla-dialogue (MIT license), the build setup from Racvb0.
+// This file only reads data of the game. It changes nothing and hooks into nothing.
 
-#include "MantellaDialogueIniConfig.h"
-#include "MantellaPapyrusInterface.h"
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
 #include "PCH.h"
-#include "json.h"  // Include nlohmann/json library
 #include "logger.h"
 
-using json = nlohmann::json;
+namespace Companion {
 
-int port;
+    // Goes up whenever the functions for the script change. The script passes it on to the companion server
+    constexpr std::int32_t INTERFACE_VERSION = 1;
+    constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
+    // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
+    constexpr char FIELD_SEPARATOR = '\t';
+    constexpr std::size_t MAX_OBJECTIVES_PER_QUEST = 6;
+    // In bytes. Longer texts are cut off
+    constexpr std::size_t MAX_TEXT_LENGTH = 200;
+    constexpr std::size_t DEFAULT_MAX_QUESTS = 25;
+    constexpr std::string_view CUT_OFF_MARK = "...";
+    constexpr std::string_view UNKNOWN_VALUE = "?";
 
-namespace Hooks {
+    // ------------------------------------------------------------------ texts
 
-    // -------------------------------------------------------------------------
-    // A small POD struct to store a single exchange: player's line, NPC's line,
-    // and the Skyrim in-game time at which it was recorded.
-    // -------------------------------------------------------------------------
-    struct DialogueLine {
-        std::string playerLine;
-        std::string playerName;
-        std::string npcLine;
-        std::string npcName;
-        float gameTimeHours;
-    };
+    std::string_view ViewOf(const char* text) { return text ? std::string_view(text) : std::string_view(); }
 
-    inline void to_json(json& j, const DialogueLine& line) {
-        j = json{{"playerName", line.playerName},
-                 {"playerQuery", line.playerLine},
-                 {"npcName", line.npcName},
-                 {"npcResponse", line.npcLine},
-                 {"gameTimeHours", line.gameTimeHours}};
+    bool EqualsIgnoreCase(std::string_view left, std::string_view right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t index = 0; index < left.size(); ++index) {
+            const int leftLetter = std::tolower(static_cast<unsigned char>(left[index]));
+            const int rightLetter = std::tolower(static_cast<unsigned char>(right[index]));
+            if (leftLetter != rightLetter) return false;
+        }
+        return true;
     }
 
-    inline void from_json(const json& j, DialogueLine& line) {
-        j.at("playerName").get_to(line.playerName);
-        j.at("playerQuery").get_to(line.playerLine);
-        j.at("npcName").get_to(line.npcName);
-        j.at("npcResponse").get_to(line.npcLine);
-        j.at("gameTimeHours").get_to(line.gameTimeHours);
+    bool StartsWithIgnoreCase(std::string_view text, std::string_view start) {
+        return text.size() >= start.size() && EqualsIgnoreCase(text.substr(0, start.size()), start);
     }
 
+    bool IsFollowByte(unsigned char byte) { return (byte & 0xC0) == 0x80; }
 
-    bool IsGreeting(std::string msg) {
-        std::string greetings[] = {"Hello", "CYRGenericHello", "DialogueGenericHello"};
-        for (std::string greeting : greetings)
-            if (msg == greeting) return true;
-        return false;
-    }
-
-    static bool IsEnabled() { return MantellaPapyrusInterface::GetMantellaEnableVanillaDialogueAwareness(); }
-
-    // -------------------------------------------------------------------------
-    // A simple helper to fetch current game time in hours.
-    // -------------------------------------------------------------------------
-    static float GetCurrentGameTimeHours() {
-        auto calendar = RE::Calendar::GetSingleton();
-        return calendar ? calendar->GetHoursPassed() : 0.0f;
-    }
-
-    // -------------------------------------------------------------------------
-    // MantellaDialogueTracker:
-    // - holds the participants list form
-    // - tracks if there's an internal error
-    // - stores unsent dialogue lines in a map keyed by Actor form ID
-    // -------------------------------------------------------------------------
-    struct MantellaDialogueTracker {
-        static inline RE::BGSListForm* aParticipants;
-        static inline bool DialogueTrackerHasError = false;
-
-        // Key = actor form ID, value = list of dialogue lines not yet added to Mantella
-        static inline std::map<RE::FormID, std::vector<DialogueLine>> s_dialogueHistory{};
-
-        // We use std::set instead of std::unordered_set
-        static inline std::set<RE::FormID> s_lastParticipants{};
-
-        static void Setup() {
-            auto dataHandler = RE::TESDataHandler::GetSingleton();
-            if (!dataHandler) {
-                logger::error("!!! MantellaDialogueTracker::Setup: TESDataHandler is null!");
-                DialogueTrackerHasError = true;
-                return;
-            }
-            aParticipants = dataHandler->LookupForm<RE::BGSListForm>(0xE4537, "Mantella.esp");
-            if (!aParticipants) {
-                logger::error("!!! MantellaDialogueTracker::Setup: aParticipants is null!");
-                DialogueTrackerHasError = true;
-                return;
-            }
-        }
-
-        // ---------------------------------------------------------------------
-        // Helper: check if the conversation is considered "running" by looking
-        // at the participants list.
-        // ---------------------------------------------------------------------
-        static bool IsConversationRunning() {
-            if (!aParticipants || DialogueTrackerHasError) return false;
-            auto scriptAddedForms = aParticipants->scriptAddedTempForms;
-            if (!scriptAddedForms) return false;
-            return !scriptAddedForms->empty();
-        }
-
-        // ---------------------------------------------------------------------
-        // Helper: checks if a given actor is listed in the current participants form list.
-        // ---------------------------------------------------------------------
-        static bool IsActorInConversation(RE::Actor* a_actor) {
-            if (!a_actor || !aParticipants || DialogueTrackerHasError) return false;
-            auto formID = a_actor->GetFormID();
-            auto scriptAddedForms = aParticipants->scriptAddedTempForms;
-            if (!scriptAddedForms) return false;
-            for (auto& actorInConvFormId : *scriptAddedForms)
-                if (actorInConvFormId == formID) return true;
-            return false;
-        }
-
-        // ---------------------------------------------------------------------
-        // Called when a conversation starts.
-        // ---------------------------------------------------------------------
-        static void OnConversationStarted() {
-            if (DialogueTrackerHasError || !aParticipants) return;
-            // Clear previous participants
-            s_lastParticipants.clear();
-            // For each form in the participants, replay old lines if any
-            auto scriptAddedForms = aParticipants->scriptAddedTempForms;
-            if (!scriptAddedForms) return;
-            for (auto& formID : *scriptAddedForms) {
-                s_lastParticipants.insert(formID);
-                // See if we have stored lines for this participant
-                auto it = s_dialogueHistory.find(formID);
-                if (it == s_dialogueHistory.end()) continue;
-                SendAndDiscardCapturedDialogue(it);
-            }
-        }
-
-        // Sends the dialogue that was captured when not in a conversation to Mantella and removes it from the backlog
-        static void SendAndDiscardCapturedDialogue(
-            std::map<RE::FormID, std::vector<DialogueLine>>::iterator dialogueLineIterator) {
-            if (dialogueLineIterator == s_dialogueHistory.end()) {
-                logger::warn("SendAndDiscardCapturedDialogue: Invalid iterator provided.");
-                return;
-            }
-            // Log the NPC name if available
-            if (!dialogueLineIterator->second.empty())
-                logger::debug("SendAndDiscardCapturedDialogue: Sending dialogue for NPC '%s'",
-                              dialogueLineIterator->second.front().npcName.c_str());
-            // Concatenate all lines into a single string
-            std::string concatenatedLines;
-            for (auto& line : dialogueLineIterator->second)
-                concatenatedLines +=
-                    line.playerName + ": " + line.playerLine + ";\n " + line.npcName + ": " + line.npcLine + " ";
-            // Remove the trailing space, if any
-            if (!concatenatedLines.empty() && concatenatedLines.back() == ' ') concatenatedLines.pop_back();
-            // Send a single Mantella event with the concatenated lines
-            if (!concatenatedLines.empty()) MantellaPapyrusInterface::AddMantellaEvent(concatenatedLines.c_str());
-            // Erase the processed entry from dialogue history
-            s_dialogueHistory.erase(dialogueLineIterator);
-            logger::debug("Actor had captured dialogue. Sent it to mantella");
-            logger::info("SendAndDiscardCapturedDialogue: Removed processed dialogue from history.");
-        }
-
-        // ---------------------------------------------------------------------
-        // Called if a new participant joins mid-conversation.
-        // ---------------------------------------------------------------------
-        static void OnNewParticipant(RE::Actor* a_newActor) {
-            if (!a_newActor || DialogueTrackerHasError) return;
-            auto newFormID = a_newActor->GetFormID();
-            auto it = s_dialogueHistory.find(newFormID);
-            if (it == s_dialogueHistory.end()) return;
-            SendAndDiscardCapturedDialogue(it);
-        }
-    };
-
-    // -------------------------------------------------------------------------
-    // ShowSubtitle hook:
-    // -------------------------------------------------------------------------
-    struct ShowSubtitle {
-        inline static std::string s_lastPlayerTopicText{};
-
-        static bool HasAlreadyProcessed(std::string_view a_topicText) { return a_topicText == s_lastPlayerTopicText; }
-
-        static void UpdateLastPlayerTopicText(std::string_view a_topicText) {
-            s_lastPlayerTopicText = std::string(a_topicText);
-        }
-
-        static void AddDialogueExchangeAsync(const DialogueLine& exchange) {
-            MantellaPapyrusInterface::AddMantellaEvent(exchange.playerName + ": " + exchange.playerLine + "; " +
-                                                       exchange.npcName + ": " + exchange.npcLine);
-        }
-
-        static bool ShouldFilterDialoge(std::string playerLine, std::string npcLine, RE::TESTopicInfo* topicInfo) {
-            if (HasAlreadyProcessed(playerLine)) return true;
-            if (std::find(MantellaDialogueIniConfig::config.PlayerLineBlacklist.begin(),
-                          MantellaDialogueIniConfig::config.PlayerLineBlacklist.end(),
-                          playerLine) != MantellaDialogueIniConfig::config.PlayerLineBlacklist.end()) {
-                logger::debug(" -> Filtered: Player Line Blacklist");
-                return true;
-            }
-            if (std::find(MantellaDialogueIniConfig::config.NPCLineBlacklist.begin(),
-                          MantellaDialogueIniConfig::config.NPCLineBlacklist.end(),
-                          npcLine) != MantellaDialogueIniConfig::config.NPCLineBlacklist.end()) {
-                logger::debug(" -> Filtered: NPC Line Blacklist");
-                return true;
-            }
-            if (topicInfo != nullptr && MantellaDialogueIniConfig::config.FilterNonUniqueGreetings &&
-                IsGreeting(playerLine) && !(topicInfo->data.flags & RE::TOPIC_INFO_DATA::TOPIC_INFO_FLAGS::kSayOnce)) {
-                logger::debug(" -> Filtered: Greeting ");
-                return true;
-            }
-            if (topicInfo == nullptr && MantellaDialogueIniConfig::config.FilterNonUniqueGreetings &&
-                IsGreeting(playerLine))
-                logger::error(" -> Error: Topic Info is null");
-            if (MantellaDialogueIniConfig::config.FilterShortReplies &&
-                MantellaDialogueIniConfig::split(npcLine, ' ').size() <
-                    MantellaDialogueIniConfig::config.FilterShortRepliesMinWordCount) {
-                logger::debug(" -> Filtered: Short reply");
-                return true;
-            }
-            return false;
-        }
-
-        static RE::MenuTopicManager::Dialogue* GetDialogue() {
-            auto topicManager = RE::MenuTopicManager::GetSingleton();
-            if (!topicManager) {
-                logger::error("!!! ShowSubtitle::thunk: MenuTopicManager is null!");
-                return nullptr;
-            }
-            return topicManager->lastSelectedDialogue;
-        }
-
-        static inline bool ShouldLogHookConfirmation = true;
-
-        // The hook function
-        static void thunk(RE::SubtitleManager* a_this, RE::TESObjectREFR* a_speaker, const char* a_subtitle,
-                          bool a_alwaysDisplay) {
-            // Call original
-            if (ShouldLogHookConfirmation == true) logger::info("Hooking into dialogue system...");
-            func(a_this, a_speaker, a_subtitle, a_alwaysDisplay);
-            if (ShouldLogHookConfirmation == true) {
-                logger::info(" -> Success");
-                ShouldLogHookConfirmation = false;
-            }
-
-            if (!IsEnabled()) {
-                logger::debug(" -> Mantella dialogue awareness is disabled.");
-                return;
-            }
-            if (!a_speaker) {
-                logger::error("!!! ShowSubtitle::thunk: a_speaker is null!");
-                return;
-            }
-            RE::MenuTopicManager::Dialogue* dialogue = GetDialogue();
-            if (dialogue == nullptr) {
-                logger::error("!!! ShowSubtitle::thunk: Cannot get dialogue!");
-                return;
-            }
-            const std::string currentPlayerTopicText = dialogue->topicText.c_str();
-            if (currentPlayerTopicText.empty()) {
-                logger::warn("ShowSubtitle::thunk: currentPlayerTopicText is empty!");
-                return;
-            }
-            // Build the NPC's response
-            std::string npcLine;
-            for (auto* response : dialogue->responses)
-                if (response && !response->text.empty())
-                    npcLine += (npcLine.empty() ? "" : " ") + std::string(response->text.c_str());
-            auto actor = skyrim_cast<RE::Actor*>(a_speaker);
-            if (!actor) {
-                logger::error("!!! ShowSubtitle::thunk: a_speaker is empty or not an actor! Line to be spoken was: {}", npcLine);
-                return;
-            }
-            // Get the player's name
-            auto player = RE::PlayerCharacter::GetSingleton();
-            const char* playerName = "Player";
-            if (player && player->GetActorBase())
-                if (auto name = player->GetActorBase()->GetName(); name && name[0] != '\0') playerName = name;
-            auto exchange = DialogueLine();
-            exchange.playerLine = currentPlayerTopicText;
-            exchange.playerName = playerName;
-            exchange.npcLine = npcLine;
-            exchange.npcName = actor->GetDisplayFullName();
-            exchange.gameTimeHours = GetCurrentGameTimeHours();
-            if (std::find(MantellaDialogueIniConfig::config.NPCNamesToIgnore.begin(),
-                          MantellaDialogueIniConfig::config.NPCNamesToIgnore.end(),
-                          exchange.npcName) != MantellaDialogueIniConfig::config.NPCNamesToIgnore.end()) {
-                logger::debug(" -> Ignored NPC from Ignorelist: {}", exchange.npcName);
-                return;
-            }
-            bool conversationRunning = MantellaDialogueTracker::IsConversationRunning();
-            bool actorInConversation = MantellaDialogueTracker::IsActorInConversation(actor);
-
-            logger::info("({}): {}", exchange.playerName, exchange.playerLine);
-            logger::info("({}): {}", exchange.npcName, exchange.npcLine);
-
-            if (ShouldFilterDialoge(currentPlayerTopicText, npcLine, dialogue->parentTopicInfo)) return;
-
-            if (!conversationRunning) {
-                if (!MantellaDialogueTracker::DialogueTrackerHasError) {
-                    auto formID = actor->GetFormID();
-                    MantellaDialogueTracker::s_dialogueHistory[formID].push_back(exchange);
-                    logger::info("  -> Not in a conv: Stored dialogue line for later use");
-                } else
-                    logger::debug(" -> Dialogue tracker is in error state :( cannot save the exchagne");
+    // The HTTP plugin of the mod drops a whole list if one text in it is not valid UTF-8
+    bool IsValidUtf(std::string_view text) {
+        std::size_t index = 0;
+        while (index < text.size()) {
+            const auto lead = static_cast<unsigned char>(text[index]);
+            std::size_t followCount = 0;
+            unsigned char lowestSecond = 0x80;
+            unsigned char highestSecond = 0xBF;
+            if (lead < 0x80) {
+                followCount = 0;
+            } else if (lead >= 0xC2 && lead <= 0xDF) {
+                followCount = 1;
+            } else if (lead >= 0xE0 && lead <= 0xEF) {
+                followCount = 2;
+                if (lead == 0xE0) lowestSecond = 0xA0;
+                if (lead == 0xED) highestSecond = 0x9F;
+            } else if (lead >= 0xF0 && lead <= 0xF4) {
+                followCount = 3;
+                if (lead == 0xF0) lowestSecond = 0x90;
+                if (lead == 0xF4) highestSecond = 0x8F;
             } else {
-                if (actorInConversation) {
-                    AddDialogueExchangeAsync(exchange);
-                    logger::info("  -> Sent dialogue to Mantella");
-                } else {
-                    AddDialogueExchangeAsync(exchange);
-                    logger::info("  -> Actor not in conversation, sent dialogue to Mantella anyways");
-                    if (!MantellaDialogueTracker::DialogueTrackerHasError) {
-                        auto formID = actor->GetFormID();
-                        MantellaDialogueTracker::s_dialogueHistory[formID].push_back(exchange);
-                        logger::info("  -> Actor not in a conv: Stored dialogue line for later use");
-                    }
+                return false;
+            }
+            if (followCount > text.size() - index - 1) return false;
+            for (std::size_t offset = 1; offset <= followCount; ++offset) {
+                const auto byte = static_cast<unsigned char>(text[index + offset]);
+                if (!IsFollowByte(byte)) return false;
+                if (offset == 1 && (byte < lowestSecond || byte > highestSecond)) return false;
+            }
+            index += followCount + 1;
+        }
+        return true;
+    }
+
+    void AppendCodePoint(std::string& target, char32_t codePoint) {
+        if (codePoint < 0x80) {
+            target += static_cast<char>(codePoint);
+        } else if (codePoint < 0x800) {
+            target += static_cast<char>(0xC0 | (codePoint >> 6));
+            target += static_cast<char>(0x80 | (codePoint & 0x3F));
+        } else {
+            target += static_cast<char>(0xE0 | (codePoint >> 12));
+            target += static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F));
+            target += static_cast<char>(0x80 | (codePoint & 0x3F));
+        }
+    }
+
+    // What the bytes 80 to 9F mean in the Windows code page for Western Europe (a question mark where it has nothing)
+    constexpr char32_t WINDOWS_SPECIALS[] = {0x20AC, 0x003F, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
+                                             0x2039, 0x0152, 0x003F, 0x017D, 0x003F, 0x003F, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
+                                             0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x003F, 0x017E, 0x0178};
+
+    // Some language versions of the game keep their texts in the Windows code page instead of UTF-8
+    std::string FromWindowsText(std::string_view text) {
+        std::string converted;
+        converted.reserve(text.size() + text.size() / 2);
+        for (const char letter : text) {
+            const auto byte = static_cast<unsigned char>(letter);
+            if (byte < 0x80) {
+                converted += letter;
+            } else if (byte < 0xA0) {
+                AppendCodePoint(converted, WINDOWS_SPECIALS[byte - 0x80]);
+            } else {
+                AppendCodePoint(converted, static_cast<char32_t>(byte));
+            }
+        }
+        return converted;
+    }
+
+    // Returns the text as valid UTF-8 in one line, without spaces around it and not longer than MAX_TEXT_LENGTH
+    std::string CleanText(std::string_view raw) {
+        std::string text = IsValidUtf(raw) ? std::string(raw) : FromWindowsText(raw);
+        for (char& letter : text) {
+            // Tabs, line breaks and the like. The tab is the separator of the quest lines
+            if (static_cast<unsigned char>(letter) < 0x20) letter = ' ';
+        }
+        const auto first = text.find_first_not_of(' ');
+        if (first == std::string::npos) return std::string();
+        const auto last = text.find_last_not_of(' ');
+        text = text.substr(first, last - first + 1);
+
+        if (text.size() > MAX_TEXT_LENGTH) {
+            std::size_t cut = MAX_TEXT_LENGTH;
+            // Do not cut a letter of several bytes in the middle
+            while (cut > 0 && IsFollowByte(static_cast<unsigned char>(text[cut]))) --cut;
+            text.resize(cut);
+            text += CUT_OFF_MARK;
+        }
+        return text;
+    }
+
+    std::string FormatNumber(float value) { return std::to_string(std::llround(value)); }
+
+    // ------------------------------------------------- placeholders in texts
+    // The text of an objective can contain placeholders that the game fills in when it shows the text:
+    // <Alias=Name> (the character, thing or place in a quest alias) and <Global=Name> (a number, eg 3 of 10).
+    // The game stores the values per run of the quest ("instance") in TESQuest::instanceData.
+
+    const RE::BGSQuestInstanceText* FindInstance(const RE::TESQuest* quest, std::uint32_t instanceID) {
+        for (const auto* instance : quest->instanceData) {
+            if (instance && instance->id == instanceID) return instance;
+        }
+        return nullptr;
+    }
+
+    const RE::BGSBaseAlias* FindAlias(const RE::TESQuest* quest, std::string_view aliasName) {
+        for (const auto* alias : quest->aliases) {
+            if (alias && EqualsIgnoreCase(static_cast<std::string_view>(alias->aliasName), aliasName)) return alias;
+        }
+        return nullptr;
+    }
+
+    // The name behind <Alias=...>, or an empty text if it cannot be found
+    std::string GetAliasText(const RE::TESQuest* quest, std::uint32_t instanceID, std::string_view aliasName) {
+        const auto* alias = FindAlias(quest, aliasName);
+        if (!alias) return std::string();
+
+        // The name the game stored for this run of the quest
+        const auto* instance = FindInstance(quest, instanceID);
+        if (instance) {
+            for (const auto& stored : instance->stringData) {
+                if (stored.aliasID != alias->aliasID) continue;
+                const auto* form = RE::TESForm::LookupByID(stored.fullNameFormID);
+                if (form) {
+                    const auto name = ViewOf(form->GetName());
+                    if (!name.empty()) return std::string(name);
                 }
             }
-            UpdateLastPlayerTopicText(currentPlayerTopicText);
         }
 
-        // Original function pointer
-        static inline REL::Relocation<decltype(thunk)> func;
+        // Otherwise the character or thing that fills the alias at the moment
+        const auto handle = quest->GetAliasedRef(alias->aliasID);
+        const auto reference = handle.get();
+        if (reference) {
+            const auto name = ViewOf(reference->GetDisplayFullName());
+            if (!name.empty()) return std::string(name);
+        }
+        return std::string();
+    }
 
-        // Install
-        static void Install() {
-            std::array targets{std::make_pair(RELOCATION_ID(19119, 19521), 0x2B2),
-                               std::make_pair(RELOCATION_ID(36543, 37544), OFFSET(0x8EC, 0x8C2))};
-            if (REL::Module::IsAE())
-                targets = std::array{std::make_pair(RELOCATION_ID(19521, 19521), 0x2B2),
-                                     std::make_pair(RELOCATION_ID(37544, 37544), OFFSET(0x8C2, 0x8C2))};
-            for (auto& [id, offset] : targets) {
-                REL::Relocation<std::uintptr_t> target(id, offset);
-                stl::write_thunk_call<ShowSubtitle>(target.address());
+    // The number behind <Global=...>, or an empty text if it cannot be found
+    std::string GetGlobalText(const RE::TESQuest* quest, std::uint32_t instanceID, std::string_view globalName) {
+        const auto* instance = FindInstance(quest, instanceID);
+        if (instance) {
+            for (const auto& stored : instance->valueData) {
+                if (stored.global && EqualsIgnoreCase(ViewOf(stored.global->GetFormEditorID()), globalName)) {
+                    return FormatNumber(stored.value);
+                }
             }
         }
+        if (quest->textGlobals) {
+            for (const auto* global : *quest->textGlobals) {
+                if (global && EqualsIgnoreCase(ViewOf(global->GetFormEditorID()), globalName)) {
+                    return FormatNumber(global->value);
+                }
+            }
+        }
+        return std::string();
+    }
+
+    // tag is what stands between < and >, eg "Alias=Jarl", "Alias.ShortName=Jarl" or "Global=Count"
+    std::string ResolveTag(std::string_view tag, const RE::TESQuest* quest, std::uint32_t instanceID) {
+        const auto equalsPlace = tag.find('=');
+        if (equalsPlace == std::string_view::npos) return std::string(tag);
+        const auto kind = tag.substr(0, equalsPlace);
+        const auto name = tag.substr(equalsPlace + 1);
+
+        if (StartsWithIgnoreCase(kind, "Alias")) {
+            const auto text = GetAliasText(quest, instanceID, name);
+            // Better the name of the alias (eg "Jarl") than a gap
+            return text.empty() ? std::string(name) : text;
+        }
+        if (EqualsIgnoreCase(kind, "Global")) {
+            const auto text = GetGlobalText(quest, instanceID, name);
+            return text.empty() ? std::string(UNKNOWN_VALUE) : text;
+        }
+        return std::string(name);
+    }
+
+    std::string ResolveTags(std::string_view text, const RE::TESQuest* quest, std::uint32_t instanceID) {
+        std::string resolved;
+        std::size_t position = 0;
+        while (position < text.size()) {
+            const auto openPlace = text.find('<', position);
+            const auto closePlace = openPlace == std::string_view::npos ? openPlace : text.find('>', openPlace);
+            if (closePlace == std::string_view::npos) {
+                resolved.append(text.substr(position));
+                break;
+            }
+            resolved.append(text.substr(position, openPlace - position));
+            resolved.append(ResolveTag(text.substr(openPlace + 1, closePlace - openPlace - 1), quest, instanceID));
+            position = closePlace + 1;
+        }
+        return resolved;
+    }
+
+    // ----------------------------------------------------------------- quests
+
+    struct OpenQuest {
+        const RE::TESQuest* quest = nullptr;
+        std::vector<std::string> objectives;
     };
 
-}  // namespace Hooks
-
-#pragma region Serialization
-// -----------------------------------------------------------------------------
-// JSON Serialization and Deserialization Functions
-// -----------------------------------------------------------------------------
-constexpr size_t MAX_DIALOGUE_LINES = 20000;
-std::string SerializeDialogueHistoryToJSON() {
-    size_t totalDialogueLines = 0;
-    for (const auto& [formID, dialogueLines] : Hooks::MantellaDialogueTracker::s_dialogueHistory) {
-        totalDialogueLines += dialogueLines.size();
-        if (totalDialogueLines > MAX_DIALOGUE_LINES) {
-            // Exceeded threshold: Discard all saved dialogue history, to avoid savegame bloat. The threshold is so high (~6MB of data)
-            // that this should never happen, but just to be safe.
-            logger::warn("!!! Exceeded max dialogue lines threshold: Discarding all saved dialogue history.");
-            return "{}";
+    // The list behind the journal: every objective the player has ever been shown, with its state.
+    // Skyrim VR keeps it at another place of the player than the other versions of the game
+    const RE::BSTArray<RE::BGSInstancedQuestObjective>* GetJournalEntries() {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return nullptr;
+        if (REL::Module::IsVR()) {
+            auto* virtualRealityData = player->GetVRPlayerRuntimeData();
+            return virtualRealityData ? &virtualRealityData->objectives : nullptr;
         }
+        return &player->GetPlayerRuntimeData().objectives;
     }
 
-    json j;
-    for (const auto& [formID, dialogueLines] : Hooks::MantellaDialogueTracker::s_dialogueHistory) {
-        j[std::to_string(formID)] = dialogueLines;
-    }
-    return j.dump();
-}
+    // The quests with at least one objective that is shown and not done, tracked quests first
+    std::vector<OpenQuest> CollectOpenQuests() {
+        std::vector<OpenQuest> quests;
+        const auto* entries = GetJournalEntries();
+        if (!entries) return quests;
 
-bool DeserializeDialogueHistoryFromJSON(const std::string& jsonString) {
-    try {
-        json j = json::parse(jsonString);
-        Hooks::MantellaDialogueTracker::s_dialogueHistory.clear();
-        for (auto it = j.begin(); it != j.end(); ++it) {
-            RE::FormID formID = static_cast<RE::FormID>(std::stoul(it.key()));
-            std::vector<Hooks::DialogueLine> dialogueLines = it.value().get<std::vector<Hooks::DialogueLine>>();
-            Hooks::MantellaDialogueTracker::s_dialogueHistory.emplace(formID, std::move(dialogueLines));
+        // If an objective is in the list more than once (a quest that ran again), the newest entry counts
+        std::vector<const RE::BGSInstancedQuestObjective*> newestEntries;
+        std::unordered_map<const RE::BGSQuestObjective*, std::size_t> placeOfObjective;
+        for (const auto& entry : *entries) {
+            if (!entry.Objective) continue;
+            const auto known = placeOfObjective.find(entry.Objective);
+            if (known == placeOfObjective.end()) {
+                placeOfObjective.emplace(entry.Objective, newestEntries.size());
+                newestEntries.push_back(&entry);
+            } else {
+                newestEntries[known->second] = &entry;
+            }
         }
-        logger::debug("Loaded {} actors with pending lines", Hooks::MantellaDialogueTracker::s_dialogueHistory.size());
-        logger::info("Deserialized dialogue history with %zu entries.",
-                     Hooks::MantellaDialogueTracker::s_dialogueHistory.size());
+
+        std::unordered_map<const RE::TESQuest*, std::size_t> placeOfQuest;
+        for (const auto* entry : newestEntries) {
+            if (entry->InstanceState != RE::QUEST_OBJECTIVE_STATE::kDisplayed) continue;
+            const auto* objective = entry->Objective;
+            const auto* quest = objective->ownerQuest;
+            if (!quest) continue;
+            if (quest->IsCompleted() || quest->data.flags.all(RE::QuestFlag::kFailed)) continue;
+
+            std::string text = CleanText(ResolveTags(static_cast<std::string_view>(objective->displayText), quest, entry->instanceID));
+            if (text.empty()) continue;
+
+            auto known = placeOfQuest.find(quest);
+            if (known == placeOfQuest.end()) {
+                OpenQuest added;
+                added.quest = quest;
+                known = placeOfQuest.emplace(quest, quests.size()).first;
+                quests.push_back(std::move(added));
+            }
+            auto& objectives = quests[known->second].objectives;
+            if (objectives.size() < MAX_OBJECTIVES_PER_QUEST) objectives.push_back(std::move(text));
+        }
+
+        std::stable_partition(quests.begin(), quests.end(), [](const OpenQuest& entry) { return entry.quest->IsActive(); });
+        return quests;
+    }
+
+    // ----------------------------------------- functions for the Papyrus script
+
+    std::int32_t GetInterfaceVersion(RE::StaticFunctionTag*) { return INTERFACE_VERSION; }
+
+    // One text per quest, the parts separated by tabs:
+    // tracked in the journal (1 or 0), type of the quest as the game numbers it (6 = miscellaneous), name of the quest,
+    // then the text of each open objective.
+    // The companion server takes these lines apart again (src/companion/game_state.py in the Mantella fork)
+    std::vector<std::string> GetOpenQuests(RE::StaticFunctionTag*, std::int32_t maxQuests) {
+        const auto quests = CollectOpenQuests();
+        const std::size_t limit = maxQuests > 0 ? static_cast<std::size_t>(maxQuests) : DEFAULT_MAX_QUESTS;
+
+        std::vector<std::string> lines;
+        for (const auto& entry : quests) {
+            if (lines.size() >= limit) break;
+            std::string line = entry.quest->IsActive() ? "1" : "0";
+            line += FIELD_SEPARATOR;
+            line += std::to_string(static_cast<std::int32_t>(entry.quest->GetType()));
+            line += FIELD_SEPARATOR;
+            line += CleanText(ViewOf(entry.quest->GetName()));
+            for (const auto& objective : entry.objectives) {
+                line += FIELD_SEPARATOR;
+                line += objective;
+            }
+            lines.push_back(std::move(line));
+        }
+        logger::debug("GetOpenQuests: {} open quests found, {} sent", quests.size(), lines.size());
+        return lines;
+    }
+
+    bool Bind(RE::BSScript::IVirtualMachine* vm) {
+        vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
+        vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
         return true;
-    } catch (const json::parse_error& e) {
-        logger::error("!!! Failed to parse dialogue history JSON: %s", e.what());
-        return false;
-    } catch (const std::exception& e) {
-        logger::error("!!! Exception during deserialization: %s", e.what());
-        return false;
     }
-}
 
-constexpr std::uint32_t kSerializationID = 'MTDL';
-
-void MySaveCallback(SKSE::SerializationInterface* a_intfc) {
-    try {
-        std::string jsonString = SerializeDialogueHistoryToJSON();
-        constexpr std::uint32_t recordType = 'HIST';
-        constexpr std::uint32_t version = 1;
-        if (!a_intfc->OpenRecord(recordType, version)) {
-            logger::error("!!! MySaveCallback: Failed to open 'HIST' record for serialization.");
-            return;
-        }
-        std::uint32_t jsonLength = static_cast<std::uint32_t>(jsonString.size());
-        if (!a_intfc->WriteRecordData(&jsonLength, sizeof(jsonLength))) {
-            logger::error("!!! MySaveCallback: Failed to write JSON string length.");
-            return;
-        }
-        if (!a_intfc->WriteRecordData(jsonString.c_str(), jsonLength)) {
-            logger::error("!!! MySaveCallback: Failed to write JSON string data.");
-            return;
-        }
-        logger::info("MySaveCallback: Serialized dialogue history to SKSE co-save.");
-    } catch (const std::exception& e) {
-        logger::error(" !!! MySaveCallback: Exception during serialization: %s", e.what());
-    }
-}
-
-void MyLoadCallback(SKSE::SerializationInterface* a_intfc) {
-    try {
-        std::uint32_t type, version, length;
-        while (a_intfc->GetNextRecordInfo(type, version, length)) {
-            if (type != 'HIST') continue;
-            std::uint32_t jsonLength = 0;
-            if (a_intfc->ReadRecordData(&jsonLength, sizeof(jsonLength)) != sizeof(jsonLength)) {
-                logger::error("!!! MyLoadCallback: Failed to read JSON string length.");
-                continue;
-            }
-            std::string jsonString(jsonLength, '\0');
-            if (a_intfc->ReadRecordData(&jsonString[0], jsonLength) != jsonLength) {
-                logger::error("!!! MyLoadCallback: Failed to read JSON string data.");
-                continue;
-            }
-            if (DeserializeDialogueHistoryFromJSON(jsonString))
-                logger::info("MyLoadCallback: Successfully loaded dialogue history from SKSE co-save.");
-            else
-                logger::error("!!! MyLoadCallback: Failed to deserialize dialogue history from JSON.");
-        }
-    } catch (const std::exception& e) {
-        logger::error("!!! MyLoadCallback: Exception during deserialization: %s", e.what());
-    }
-}
-
-void MyRevertCallback(SKSE::SerializationInterface*) {
-    Hooks::MantellaDialogueTracker::s_dialogueHistory.clear();
-    logger::info("MyRevertCallback: Cleared dialogue history.");
-}
-#pragma endregion
-
-// -----------------------------------------------------------------------------
-// SKSE Messaging Interface Listener
-// -----------------------------------------------------------------------------
-
-void OnSKSEMessage(SKSE::MessagingInterface::Message* a_msg) {
-    if (a_msg->type == SKSE::MessagingInterface::kDataLoaded) Hooks::MantellaDialogueTracker::Setup();
-    if (a_msg->type == SKSE::MessagingInterface::kPostLoad) {
-        auto serialization = SKSE::GetSerializationInterface();
-        if (!serialization) {
-            logger::error("!!! OnSKSEMessage: Failed to get SKSE Serialization Interface.");
-            return;
-        }
-       
-        try {
-            serialization->SetUniqueID(kSerializationID);
-            serialization->SetSaveCallback(MySaveCallback);
-            serialization->SetLoadCallback(MyLoadCallback);
-            serialization->SetRevertCallback(MyRevertCallback);
-        } 
-        catch (const std::exception& e) {
-            logger::error("!!! OnSKSEMessage: Exception during SKSE Serialization callbacks: %s", e.what());
-        }
-
-        logger::info("OnSKSEMessage: Registered SKSE Serialization callbacks for dialogue history.");
-    }
-}
-
-void notifyConversationStart(RE::StaticFunctionTag*) {
-    logger::info("Conversation Started");
-    if (!Hooks::IsEnabled()) return;
-    Hooks::MantellaDialogueTracker::OnConversationStarted();
-}
-
-void notifyActorAdded(RE::StaticFunctionTag*, std::vector<RE::TESForm*> actors) {
-    // calll OnNewParticipant() for each actor
-    for (auto* actor : actors) {
-        auto actorForm = skyrim_cast<RE::Actor*>(actor);
-        if (!actorForm) {
-            logger::error("!!! notifyActorAdded: Actor is not an Actor form!");
-            continue;
-        }
-        Hooks::MantellaDialogueTracker::OnNewParticipant(actorForm);
-    }
-}
-
-void notifyActorRemoved(RE::StaticFunctionTag*, std::vector<RE::TESForm*> actors) {
-    logger::debug("Actor left conversation");
-}
-
-void notifyConversationEnd(RE::StaticFunctionTag*) {
-    logger::info("Conversation Ended");
-    if (!Hooks::IsEnabled()) return;
-    Hooks::MantellaDialogueTracker::s_lastParticipants.clear();
-}
-
-bool Bind(RE::BSScript::IVirtualMachine* vm) {
-    std::string classname = "MantellaVanillaDialogue";
-    vm->RegisterFunction("notifyConversationStart", classname, notifyConversationStart);
-    vm->RegisterFunction("notifyNpcAdded", classname, notifyActorAdded);
-    vm->RegisterFunction("notifyNpcRemoved", classname, notifyActorRemoved);
-    vm->RegisterFunction("notifyConversationEnd", classname, notifyConversationEnd);
-    return true;
-}
+}  // namespace Companion
 
 SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::Init(skse);
-    SKSE::GetPapyrusInterface()->Register(Bind);
     SetupLog();
-    MantellaDialogueIniConfig::loadConfiguration();
-    if (auto messaging = SKSE::GetMessagingInterface()) {
-        messaging->RegisterListener("SKSE", OnSKSEMessage);
-        logger::info("SKSEPluginLoad: Registered SKSE messaging listener.");
-    } else
-        logger::error("!!! SKSEPluginLoad: Failed to get SKSE Messaging Interface!");
-    Hooks::ShowSubtitle::Install();
-    logger::info("SKSEPluginLoad: Installed ShowSubtitle hook.");
+    SKSE::GetPapyrusInterface()->Register(Companion::Bind);
+    logger::info("Loaded. Functions for the script {} registered, interface version {}.", Companion::SCRIPT_NAME,
+                 Companion::INTERFACE_VERSION);
     return true;
 }

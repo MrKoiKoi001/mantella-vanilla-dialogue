@@ -11,7 +11,7 @@ namespace logger = SKSE::log;
 void SetupLog() {
     auto logsFolder = SKSE::log::log_directory();
     if (!logsFolder) SKSE::stl::report_and_fail("SKSE log_directory not provided, logs disabled.");
-    auto pluginName = "MantellaDialogue";
+    auto pluginName = "KI_MCP_Gefaehrte";
     auto logFilePath = *logsFolder / std::format("{}.log", pluginName);
     auto fileLoggerPtr = std::make_shared<spdlog::sinks::basic_file_sink_mt>(logFilePath.string(), true);
     std::shared_ptr<spdlog::logger> loggerPtr;
