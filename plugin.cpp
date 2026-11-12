@@ -1,14 +1,23 @@
 // Plugin of the AI companion mod for Skyrim (KI_MCP_Gefaehrte.esp).
 // It reads what Papyrus scripts cannot get at and hands it to the script KI_MCP_Gefaehrte_Native.
-// So far: the open quests of the player with the texts of their objectives.
+// So far: the open quests of the player with the texts of their objectives,
+// and what the characters around the player say (the subtitles of the game).
 //
-// The project layout comes from mikastamm/mantella-vanilla-dialogue (MIT license), the build setup from Racvb0.
-// This file only reads data of the game. It changes nothing and hooks into nothing.
+// The project layout and the places of the subtitle hook come from mikastamm/mantella-vanilla-dialogue (MIT license),
+// the build setup from Racvb0.
+// The quests are only read. For the subtitles the plugin hooks into two calls of the game (see InstallSubtitleHook).
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <deque>
+#include <format>
+#include <fstream>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -20,7 +29,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 1;
+    constexpr std::int32_t INTERFACE_VERSION = 2;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -29,6 +38,37 @@ namespace Companion {
     constexpr std::size_t MAX_TEXT_LENGTH = 200;
     constexpr std::size_t DEFAULT_MAX_QUESTS = 25;
     constexpr std::string_view CUT_OFF_MARK = "...";
+
+    // What was heard and not fetched by the script yet. Older lines make room for newer ones
+    constexpr std::size_t MAX_STORED_HEARD_LINES = 40;
+    constexpr std::size_t DEFAULT_MAX_HEARD_LINES = 20;
+    constexpr std::size_t MAX_HEARD_TEXT_LENGTH = 300;
+    // Lines older than this are not handed out any more
+    constexpr std::int64_t MAX_HEARD_AGE_SECONDS = 600;
+    // The same line of the same speaker within this time counts as one
+    constexpr std::int64_t SAME_LINE_SECONDS = 20;
+
+    // A line "HearSubtitles=0" in this file (seen from the folder of the game) keeps the plugin from hooking into the game
+    constexpr char SETTINGS_FILE[] = "Data\\SKSE\\Plugins\\KI_MCP_Gefaehrte.ini";
+    constexpr std::string_view SETTING_HEARING_OFF = "hearsubtitles=0";
+
+    // Where the game calls SubtitleManager::ShowSubtitle: IDs of the two calling functions in the Address Library
+    // (Skyrim SE and VR, then AE) and how far into the function the call is. Taken from mantella-vanilla-dialogue
+    constexpr std::uint64_t REFERENCE_SOUND_ID_SE = 19119;
+    constexpr std::uint64_t REFERENCE_SOUND_ID_AE = 19521;
+    constexpr std::ptrdiff_t REFERENCE_SOUND_CALL_OFFSET = 0x2B2;
+    constexpr std::uint64_t ACTOR_SOUND_ID_SE = 36543;
+    constexpr std::uint64_t ACTOR_SOUND_ID_AE = 37544;
+    constexpr std::ptrdiff_t ACTOR_SOUND_CALL_OFFSET_SE = 0x8EC;
+    constexpr std::ptrdiff_t ACTOR_SOUND_CALL_OFFSET_AE = 0x8C2;
+    // SubtitleManager::ShowSubtitle itself
+    constexpr std::uint64_t SHOW_SUBTITLE_ID_SE = 51753;
+    constexpr std::uint64_t SHOW_SUBTITLE_ID_AE = 52626;
+    // A call to a fixed address is the byte E8 followed by the distance to the target as four bytes
+    constexpr std::uint8_t DIRECT_CALL_BYTE = 0xE8;
+    constexpr std::size_t DIRECT_CALL_LENGTH = 5;
+    // Each redirected call needs 14 bytes of the trampoline
+    constexpr std::size_t TRAMPOLINE_BYTES = 64;
     constexpr std::string_view UNKNOWN_VALUE = "?";
 
     // ------------------------------------------------------------------ texts
@@ -120,8 +160,8 @@ namespace Companion {
         return converted;
     }
 
-    // Returns the text as valid UTF-8 in one line, without spaces around it and not longer than MAX_TEXT_LENGTH
-    std::string CleanText(std::string_view raw) {
+    // Returns the text as valid UTF-8 in one line, without spaces around it and not longer than maxLength bytes
+    std::string CleanText(std::string_view raw, std::size_t maxLength = MAX_TEXT_LENGTH) {
         std::string text = IsValidUtf(raw) ? std::string(raw) : FromWindowsText(raw);
         for (char& letter : text) {
             // Tabs, line breaks and the like. The tab is the separator of the quest lines
@@ -132,8 +172,8 @@ namespace Companion {
         const auto last = text.find_last_not_of(' ');
         text = text.substr(first, last - first + 1);
 
-        if (text.size() > MAX_TEXT_LENGTH) {
-            std::size_t cut = MAX_TEXT_LENGTH;
+        if (text.size() > maxLength) {
+            std::size_t cut = maxLength;
             // Do not cut a letter of several bytes in the middle
             while (cut > 0 && IsFollowByte(static_cast<unsigned char>(text[cut]))) --cut;
             text.resize(cut);
@@ -312,9 +352,195 @@ namespace Companion {
         return quests;
     }
 
+    // ---------------------------------------------------------------- hearing
+    // The game calls SubtitleManager::ShowSubtitle for every line a character near the player speaks.
+    // The plugin redirects the two calls through its own function, which passes the call on and keeps the line.
+    // The script fetches the kept lines when the companion server asks for the state.
+
+    struct HeardLine {
+        RE::FormID speakerID = 0;
+        std::string speakerName;
+        std::string text;
+        std::chrono::steady_clock::time_point time;
+    };
+
+    std::mutex heardLock;
+    std::deque<HeardLine> heardLines;
+    // The choice in the dialogue menu that was kept last, so that it is kept only once
+    const void* lastChoice = nullptr;
+    std::string lastChoiceText;
+    bool isHearing = false;
+
+    std::int64_t SecondsBetween(std::chrono::steady_clock::time_point earlier, std::chrono::steady_clock::time_point later) {
+        return std::chrono::duration_cast<std::chrono::seconds>(later - earlier).count();
+    }
+
+    void KeepHeardLine(RE::FormID speakerID, std::string_view speakerName, std::string_view rawText) {
+        std::string text = CleanText(rawText, MAX_HEARD_TEXT_LENGTH);
+        if (text.empty()) return;
+        const auto now = std::chrono::steady_clock::now();
+
+        const std::lock_guard<std::mutex> guard(heardLock);
+        for (const auto& known : heardLines) {
+            if (known.speakerID == speakerID && known.text == text && SecondsBetween(known.time, now) < SAME_LINE_SECONDS) return;
+        }
+        HeardLine line;
+        line.speakerID = speakerID;
+        line.speakerName = CleanText(speakerName);
+        line.text = std::move(text);
+        line.time = now;
+        heardLines.push_back(std::move(line));
+        while (heardLines.size() > MAX_STORED_HEARD_LINES) heardLines.pop_front();
+    }
+
+    // While the dialogue menu is open, the line the player picked last is what the character answers to.
+    // It has no subtitle of its own, so it is kept here, once per choice and before the answer
+    void KeepPlayerChoice() {
+        const auto* topics = RE::MenuTopicManager::GetSingleton();
+        if (!topics || !topics->menuOpen) return;
+        const auto* choice = topics->lastSelectedDialogue;
+        if (!choice) return;
+        const auto text = ViewOf(choice->topicText.c_str());
+        if (text.empty()) return;
+        {
+            const std::lock_guard<std::mutex> guard(heardLock);
+            if (choice == lastChoice && text == lastChoiceText) return;
+            lastChoice = choice;
+            lastChoiceText = std::string(text);
+        }
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return;
+        KeepHeardLine(player->GetFormID(), ViewOf(player->GetDisplayFullName()), text);
+    }
+
+    void OnSubtitle(RE::TESObjectREFR* speaker, const char* subtitle) noexcept {
+        try {
+            if (!speaker || !subtitle || subtitle[0] == '\0') return;
+            KeepPlayerChoice();
+            KeepHeardLine(speaker->GetFormID(), ViewOf(speaker->GetDisplayFullName()), subtitle);
+        } catch (...) {
+            // Whatever goes wrong here must not reach the game
+        }
+    }
+
+    void ForgetHeardLines() {
+        const std::lock_guard<std::mutex> guard(heardLock);
+        heardLines.clear();
+        lastChoice = nullptr;
+        lastChoiceText.clear();
+    }
+
+    struct SubtitleHook {
+        static void Thunk(RE::SubtitleManager* manager, RE::TESObjectREFR* speaker, const char* subtitle, bool alwaysDisplay) {
+            original(manager, speaker, subtitle, alwaysDisplay);
+            OnSubtitle(speaker, subtitle);
+        }
+        static inline REL::Relocation<decltype(Thunk)> original;
+    };
+
+    bool IsHearingSwitchedOff() {
+        std::ifstream file(SETTINGS_FILE);
+        std::string line;
+        while (std::getline(file, line)) {
+            std::string compact;
+            for (const char letter : line) {
+                if (!std::isspace(static_cast<unsigned char>(letter))) {
+                    compact += static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
+                }
+            }
+            if (compact == SETTING_HEARING_OFF) return true;
+        }
+        return false;
+    }
+
+    // Where the call at this address goes, or 0 if there is no call to a fixed address
+    std::uintptr_t GetDirectCallTarget(std::uintptr_t address) {
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(address);
+        if (bytes[0] != DIRECT_CALL_BYTE) return 0;
+        std::int32_t distance = 0;
+        std::memcpy(&distance, bytes + 1, sizeof(distance));
+        return address + DIRECT_CALL_LENGTH + distance;
+    }
+
+    // Redirects the two calls of ShowSubtitle through SubtitleHook::Thunk.
+    // The places inside the two functions are known for Skyrim SE and AE. Before anything is changed, both places
+    // are checked: each has to be a call that goes to ShowSubtitle. If not (another version of the game,
+    // or another mod was there first), nothing is changed and the plugin only does without hearing
+    bool InstallSubtitleHook() {
+        if (IsHearingSwitchedOff()) {
+            logger::info("Hearing is switched off in {}.", SETTINGS_FILE);
+            return false;
+        }
+        const std::ptrdiff_t actorOffset = REL::Module::IsAE() ? ACTOR_SOUND_CALL_OFFSET_AE : ACTOR_SOUND_CALL_OFFSET_SE;
+        REL::Relocation<std::uintptr_t> referenceSite(RELOCATION_ID(REFERENCE_SOUND_ID_SE, REFERENCE_SOUND_ID_AE), REFERENCE_SOUND_CALL_OFFSET);
+        REL::Relocation<std::uintptr_t> actorSite(RELOCATION_ID(ACTOR_SOUND_ID_SE, ACTOR_SOUND_ID_AE), actorOffset);
+        REL::Relocation<std::uintptr_t> showSubtitle(RELOCATION_ID(SHOW_SUBTITLE_ID_SE, SHOW_SUBTITLE_ID_AE));
+        const std::array<std::uintptr_t, 2> sites{ referenceSite.address(), actorSite.address() };
+
+        for (const auto site : sites) {
+            const auto target = GetDirectCallTarget(site);
+            if (target != showSubtitle.address()) {
+                logger::error("No hearing: the call at {:X} goes to {:X} instead of ShowSubtitle at {:X}. Nothing was changed.", site,
+                              target, showSubtitle.address());
+                return false;
+            }
+        }
+
+        auto& trampoline = SKSE::GetTrampoline();
+        // Older versions of SKSE (as the one for Skyrim VR) hand out no memory for this, so the plugin gets its own
+        if (trampoline.empty()) trampoline.create(TRAMPOLINE_BYTES);
+        for (const auto site : sites) {
+            SubtitleHook::original = trampoline.write_call<DIRECT_CALL_LENGTH>(site, SubtitleHook::Thunk);
+        }
+        logger::info("Hearing: hooked into the two calls of ShowSubtitle.");
+        return true;
+    }
+
+    void OnMessage(SKSE::MessagingInterface::Message* message) {
+        if (!message) return;
+        // What was said before a save is loaded or a new game starts belongs to another game
+        if (message->type == SKSE::MessagingInterface::kPreLoadGame || message->type == SKSE::MessagingInterface::kNewGame) {
+            ForgetHeardLines();
+        }
+    }
+
     // ----------------------------------------- functions for the Papyrus script
 
     std::int32_t GetInterfaceVersion(RE::StaticFunctionTag*) { return INTERFACE_VERSION; }
+
+    // Whether the plugin could hook into the subtitles of the game (see InstallSubtitleHook)
+    bool IsHearing(RE::StaticFunctionTag*) { return isHearing; }
+
+    // The lines that were heard since the last call, oldest first, at most maxLines (then the newest ones).
+    // One text per line, its parts separated by tabs:
+    // how many seconds ago, ref ID of the speaker as eight hex digits, name of the speaker, what was said.
+    // A line the player picked in a dialogue menu has the player as its speaker
+    std::vector<std::string> TakeHeardLines(RE::StaticFunctionTag*, std::int32_t maxLines) {
+        const std::size_t limit = maxLines > 0 ? static_cast<std::size_t>(maxLines) : DEFAULT_MAX_HEARD_LINES;
+        const auto now = std::chrono::steady_clock::now();
+
+        std::deque<HeardLine> taken;
+        {
+            const std::lock_guard<std::mutex> guard(heardLock);
+            taken.swap(heardLines);
+        }
+        while (taken.size() > limit) taken.pop_front();
+
+        std::vector<std::string> lines;
+        for (const auto& heard : taken) {
+            const auto age = SecondsBetween(heard.time, now);
+            if (age > MAX_HEARD_AGE_SECONDS) continue;
+            std::string line = std::to_string(age);
+            line += FIELD_SEPARATOR;
+            line += std::format("{:08X}", heard.speakerID);
+            line += FIELD_SEPARATOR;
+            line += heard.speakerName;
+            line += FIELD_SEPARATOR;
+            line += heard.text;
+            lines.push_back(std::move(line));
+        }
+        return lines;
+    }
 
     // One text per quest, the parts separated by tabs:
     // tracked in the journal (1 or 0), type of the quest as the game numbers it (6 = miscellaneous), name of the quest,
@@ -345,6 +571,8 @@ namespace Companion {
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
+        vm->RegisterFunction("IsHearing", SCRIPT_NAME, IsHearing);
+        vm->RegisterFunction("TakeHeardLines", SCRIPT_NAME, TakeHeardLines);
         return true;
     }
 
@@ -356,5 +584,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::GetPapyrusInterface()->Register(Companion::Bind);
     logger::info("Loaded. Functions for the script {} registered, interface version {}.", Companion::SCRIPT_NAME,
                  Companion::INTERFACE_VERSION);
+    Companion::isHearing = Companion::InstallSubtitleHook();
+    if (const auto* messaging = SKSE::GetMessagingInterface()) {
+        messaging->RegisterListener("SKSE", Companion::OnMessage);
+    }
     return true;
 }

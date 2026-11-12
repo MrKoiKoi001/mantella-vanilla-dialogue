@@ -2,7 +2,10 @@
 
 SKSE plugin of an AI companion mod for Skyrim (SE, AE and VR). It reads what Papyrus scripts cannot get at and hands it to the script `KI_MCP_Gefaehrte_Native`.
 
-So far it has one job: the open quests of the journal with the texts of their objectives.
+It has two jobs:
+
+- the open quests of the journal with the texts of their objectives
+- what the characters around the player say (the subtitles of the game)
 
 ## Build
 
@@ -13,10 +16,16 @@ GitHub builds the DLL: every push to `master` starts the workflow "Build KI_MCP_
 ```papyrus
 int Function GetInterfaceVersion() global native
 string[] Function GetOpenQuests(int maxQuests) global native
+bool Function IsHearing() global native
+string[] Function TakeHeardLines(int maxLines) global native
 ```
 
 `GetOpenQuests` returns one text per quest, its parts separated by tabs: tracked (1 or 0), type of the quest, name of the quest, then the text of each open objective.
 
+`TakeHeardLines` returns the lines heard since the last call, one text per line: seconds ago, ref ID of the speaker, name of the speaker, what was said.
+
+For the subtitles the plugin hooks into two calls of the game. A line `HearSubtitles=0` in `Data\SKSE\Plugins\KI_MCP_Gefaehrte.ini` switches that off.
+
 ## Credits
 
-Forked from [mikastamm/mantella-vanilla-dialogue](https://github.com/mikastamm/mantella-vanilla-dialogue) (MIT license), the plugin that makes Mantella aware of vanilla dialogue. The build on GitHub comes from the fork by [Racvb0](https://github.com/Racvb0/mantella-vanilla-dialogue). The dialogue tracking of the original is not part of this plugin at the moment.
+Forked from [mikastamm/mantella-vanilla-dialogue](https://github.com/mikastamm/mantella-vanilla-dialogue) (MIT license), the plugin that makes Mantella aware of vanilla dialogue. The build on GitHub comes from the fork by [Racvb0](https://github.com/Racvb0/mantella-vanilla-dialogue). The places of the subtitle hook come from the original.
