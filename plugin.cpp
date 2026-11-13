@@ -2,6 +2,7 @@
 // It reads what Papyrus scripts cannot get at and hands it to the script KI_MCP_Gefaehrte_Native.
 // So far: the open quests of the player with the texts of their objectives and where their targets are,
 // the places around the player (map markers and doors that lead somewhere),
+// the things close to the player (furniture, containers and items that lie around),
 // and what the characters around the player say (the subtitles of the game).
 //
 // The project layout and the places of the subtitle hook come from mikastamm/mantella-vanilla-dialogue (MIT license),
@@ -32,7 +33,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 3;
+    constexpr std::int32_t INTERFACE_VERSION = 4;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -102,6 +103,17 @@ namespace Companion {
     constexpr std::size_t DEFAULT_MAX_DOORS = 8;
     // What the script learns about a map marker: whether the player has been there (can travel to it)
     constexpr std::int32_t MARKER_IS_KNOWN = 1;
+
+    // Things close to the player: kinds of lines, what the script learns about a thing, and the limits if the script names none
+    constexpr std::int32_t THING_IS_FURNITURE = 0;
+    constexpr std::int32_t THING_IS_CONTAINER = 1;
+    constexpr std::int32_t THING_IS_ITEM = 2;
+    constexpr std::size_t THING_KIND_COUNT = 3;
+    // For furniture: a character can sit on it. For a container: it is locked
+    constexpr std::int32_t FURNITURE_IS_SEAT = 1;
+    constexpr std::int32_t CONTAINER_IS_LOCKED = 1;
+    constexpr std::int32_t DEFAULT_THING_RADIUS_METERS = 10;
+    constexpr std::size_t DEFAULT_MAX_THINGS_PER_KIND = 4;
 
     // Functions of the game this plugin calls through the Address Library, by their IDs for Skyrim SE (which Skyrim VR shares).
     // The Address Library for Skyrim VR is a file that grows from release to release, and an ID it does not have
@@ -703,6 +715,99 @@ namespace Companion {
         return places;
     }
 
+    // ----------------------------------------------------------------- things
+    // What stands and lies around the player: furniture (chairs, benches, beds, workbenches), containers (chests, barrels,
+    // sacks) and items that can be picked up. The companion can sit down on a seat and empty a container,
+    // so each thing goes out with its ref ID
+
+    struct Thing {
+        std::int32_t kind = THING_IS_ITEM;
+        RE::FormID referenceID = 0;
+        float distance = 0.0f;
+        View view;
+        std::int32_t flags = 0;
+        std::string name;
+    };
+
+    // Which kind of thing a reference is by what it is made from, or -1 if it is nothing for this list
+    std::int32_t GetThingKind(const RE::TESBoundObject* base) {
+        switch (base->GetFormType()) {
+            case RE::FormType::Furniture:
+                return THING_IS_FURNITURE;
+            case RE::FormType::Container:
+                return THING_IS_CONTAINER;
+            case RE::FormType::Weapon:
+            case RE::FormType::Armor:
+            case RE::FormType::Ammo:
+            case RE::FormType::AlchemyItem:
+            case RE::FormType::Ingredient:
+            case RE::FormType::Book:
+            case RE::FormType::Scroll:
+            case RE::FormType::SoulGem:
+            case RE::FormType::KeyMaster:
+            case RE::FormType::Misc:
+                return THING_IS_ITEM;
+            default:
+                return -1;
+        }
+    }
+
+    // The things within the radius around the player: of every kind the nearest ones, at most limitPerKind,
+    // furniture first, then containers, then items. Things without a name are left out (the game has many
+    // invisible pieces of furniture that only tell characters where to lean or stand)
+    std::vector<Thing> CollectThings(RE::PlayerCharacter* player, float radius, std::size_t limitPerKind) {
+        std::array<std::vector<Thing>, THING_KIND_COUNT> thingsByKind;
+        if (!HasGameAddress(WORLD_SINGLETON_ID)) return {};
+        auto* world = RE::TES::GetSingleton();
+        if (!world) return {};
+        const auto own = player->GetPosition();
+
+        world->ForEachReferenceInRange(player, radius, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference == player || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            const auto* base = reference->GetBaseObject();
+            const std::int32_t kind = base ? GetThingKind(base) : -1;
+            if (kind < 0) return RE::BSContainer::ForEachResult::kContinue;
+            std::string name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            if (name.empty()) return RE::BSContainer::ForEachResult::kContinue;
+
+            Thing thing;
+            thing.kind = kind;
+            thing.referenceID = reference->GetFormID();
+            thing.name = std::move(name);
+            thing.distance = own.GetDistance(reference->GetPosition());
+            thing.view = GetViewFromPlayer(player, reference->GetPosition());
+            if (kind == THING_IS_FURNITURE) {
+                const auto* furniture = base->As<RE::TESFurniture>();
+                if (furniture && furniture->furnFlags.any(RE::TESFurniture::ActiveMarker::kCanSit)) thing.flags = FURNITURE_IS_SEAT;
+            } else if (kind == THING_IS_CONTAINER) {
+                const auto* extra = reference->extraList.GetByType<RE::ExtraLock>();
+                if (extra && extra->lock && extra->lock->IsLocked()) thing.flags = CONTAINER_IS_LOCKED;
+            }
+            thingsByKind[static_cast<std::size_t>(kind)].push_back(std::move(thing));
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+
+        std::vector<Thing> things;
+        for (auto& ofOneKind : thingsByKind) {
+            std::sort(ofOneKind.begin(), ofOneKind.end(), [](const Thing& left, const Thing& right) { return left.distance < right.distance; });
+            std::size_t keptCount = 0;
+            std::vector<std::string_view> keptNames;
+            for (auto& thing : ofOneKind) {
+                if (keptCount >= limitPerKind) break;
+                // Ten plates on a table are one line. Chairs and chests stay apart, because each can be used on its own
+                if (thing.kind == THING_IS_ITEM) {
+                    if (std::find(keptNames.begin(), keptNames.end(), std::string_view(thing.name)) != keptNames.end()) continue;
+                    keptNames.push_back(thing.name);
+                }
+                things.push_back(thing);
+                ++keptCount;
+            }
+        }
+        return things;
+    }
+
     // ---------------------------------------------------------------- hearing
     // The game calls SubtitleManager::ShowSubtitle for every line a character near the player speaks.
     // The plugin redirects the two calls through its own function, which passes the call on and keeps the line.
@@ -1014,6 +1119,36 @@ namespace Companion {
         return lines;
     }
 
+    // The things close to the player: furniture first, then containers, then items that lie around, each nearest first,
+    // at most maxPerKind of each kind within radiusMeters. One text per thing, its parts separated by tabs:
+    // kind (0 = furniture, 1 = container, 2 = item), ref ID as eight hex digits, distance to the player in meters,
+    // angle from where the player faces in degrees (negative = left),
+    // for furniture 1 if a character can sit on it, for a container 1 if it is locked (0 otherwise), name
+    std::vector<std::string> GetNearbyThings(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxPerKind) {
+        std::vector<std::string> lines;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return lines;
+        const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_THING_RADIUS_METERS) * GAME_UNITS_PER_METER;
+        const std::size_t limit = maxPerKind > 0 ? static_cast<std::size_t>(maxPerKind) : DEFAULT_MAX_THINGS_PER_KIND;
+
+        for (const auto& thing : CollectThings(player, radius, limit)) {
+            std::string line = std::to_string(thing.kind);
+            line += FIELD_SEPARATOR;
+            line += std::format("{:08X}", thing.referenceID);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(thing.view.distanceMeters);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(thing.view.angleDegrees);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(thing.flags);
+            line += FIELD_SEPARATOR;
+            line += thing.name;
+            lines.push_back(std::move(line));
+        }
+        logger::debug("GetNearbyThings: {} things sent", lines.size());
+        return lines;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -1021,6 +1156,7 @@ namespace Companion {
         vm->RegisterFunction("TakeHeardLines", SCRIPT_NAME, TakeHeardLines);
         vm->RegisterFunction("GetQuestTargets", SCRIPT_NAME, GetQuestTargets);
         vm->RegisterFunction("GetNearbyPlaces", SCRIPT_NAME, GetNearbyPlaces);
+        vm->RegisterFunction("GetNearbyThings", SCRIPT_NAME, GetNearbyThings);
         return true;
     }
 
@@ -1039,7 +1175,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
                      Companion::CONDITION_IS_TRUE_ID);
     }
     if (!Companion::HasGameAddress(Companion::WORLD_SINGLETON_ID)) {
-        logger::warn("The Address Library has no ID {}: no doors among the places.", Companion::WORLD_SINGLETON_ID);
+        logger::warn("The Address Library has no ID {}: no doors among the places and no things around.", Companion::WORLD_SINGLETON_ID);
     }
     if (const auto* messaging = SKSE::GetMessagingInterface()) {
         messaging->RegisterListener("SKSE", Companion::OnMessage);
