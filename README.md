@@ -23,6 +23,7 @@ string[] Function TakeHeardLines(int maxLines) global native
 string[] Function GetQuestTargets(int maxQuests, int maxTargets, Actor origin) global native
 string[] Function GetNearbyPlaces(int radiusMeters, int maxMarkers, int maxDoors, Actor origin) global native
 string[] Function GetNearbyThings(int radiusMeters, int maxPerKind, Actor origin) global native
+string Function GetVoiceTypeName(Actor target) global native
 ```
 
 `GetOpenQuests` returns one text per quest, its parts separated by tabs: tracked (1 or 0), type of the quest, name of the quest, then the text of each open objective.
@@ -36,6 +37,8 @@ The last three functions see everything from `origin` (the viewer): distances, a
 `GetNearbyPlaces` returns the map markers and the doors into other areas around the viewer, one text per place: kind (0 = map marker, 1 = door), ref ID, distance in meters, angle, kind of map marker, 1 if the player has been there, name.
 
 `GetNearbyThings` returns the furniture, containers and items close to the viewer, one text per thing: kind (0 = furniture, 1 = container, 2 = item), ref ID, distance in meters, angle, 1 for a seat or a locked container, name.
+
+`GetVoiceTypeName` returns the name of the voice of a character (the editor ID of its voice type, eg `FemaleEvenToned`), which is also the name of the folder the game looks in for the sound of what the character says.
 
 For the subtitles the plugin hooks into two calls of the game. A line `HearSubtitles=0` in `Data\SKSE\Plugins\KI_MCP_Gefaehrte.ini` switches that off.
 

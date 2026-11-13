@@ -33,7 +33,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 5;
+    constexpr std::int32_t INTERFACE_VERSION = 6;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -980,6 +980,16 @@ namespace Companion {
 
     std::int32_t GetInterfaceVersion(RE::StaticFunctionTag*) { return INTERFACE_VERSION; }
 
+    // The name of the voice of a character as the files of the game know it: the editor ID of its voice type
+    // (eg FemaleEvenToned). The game looks for the sound files of what a character says in a folder of that name,
+    // so the companion server needs it to put a spoken line where the game finds it. Empty if there is none
+    RE::BSFixedString GetVoiceTypeName(RE::StaticFunctionTag*, RE::Actor* actor) {
+        const auto* base = actor ? actor->GetActorBase() : nullptr;
+        const auto* voice = base ? base->voiceType : nullptr;
+        const char* name = voice ? voice->GetFormEditorID() : nullptr;
+        return name ? RE::BSFixedString(name) : RE::BSFixedString();
+    }
+
     // Whether the plugin could hook into the subtitles of the game (see InstallSubtitleHook)
     bool IsHearing(RE::StaticFunctionTag*) { return isHearing; }
 
@@ -1184,6 +1194,7 @@ namespace Companion {
         vm->RegisterFunction("GetQuestTargets", SCRIPT_NAME, GetQuestTargets);
         vm->RegisterFunction("GetNearbyPlaces", SCRIPT_NAME, GetNearbyPlaces);
         vm->RegisterFunction("GetNearbyThings", SCRIPT_NAME, GetNearbyThings);
+        vm->RegisterFunction("GetVoiceTypeName", SCRIPT_NAME, GetVoiceTypeName);
         return true;
     }
 
