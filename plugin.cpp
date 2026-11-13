@@ -34,7 +34,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 8;
+    constexpr std::int32_t INTERFACE_VERSION = 9;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -124,6 +124,8 @@ namespace Companion {
     constexpr std::int32_t THING_IS_CONTAINER = 1;
     constexpr std::int32_t THING_IS_ITEM = 2;
     constexpr std::size_t THING_KIND_COUNT = 3;
+    // Traps go out through a function of their own (GetNearbyTraps), in lines built like those of the things
+    constexpr std::int32_t THING_IS_TRAP = 3;
     // For furniture: a character can sit on it. For a container: it is locked
     constexpr std::int32_t FURNITURE_IS_SEAT = 1;
     constexpr std::int32_t CONTAINER_IS_LOCKED = 1;
@@ -136,12 +138,58 @@ namespace Companion {
     // The name such a table goes out with
     constexpr std::string_view TABLE_NAME = "Table";
     constexpr std::size_t DEFAULT_MAX_THINGS_PER_KIND = 4;
+    // Traps and what sets them off (tripwires, pressure plates, bear traps, swinging maces ...) have no name either.
+    // The models of all of them lie in this folder of the game, each kind in a folder of its own
+    // (eg traps\tripwire\traptripwire01.nif, traps\pressureplate\trapstonepressureplate01.nif), and that folder names the kind
+    constexpr std::string_view TRAP_MODEL_FOLDER = "traps\\";
+    constexpr std::int32_t DEFAULT_TRAP_RADIUS_METERS = 15;
+    constexpr std::size_t DEFAULT_MAX_TRAPS = 6;
+    // An arrow that was shot stays in the world as a projectile, not as an item. One that has hit something,
+    // or that moves slower than this (game units per second), has come to rest and can be picked up
+    constexpr float RESTING_ARROW_SPEED = 1.0f;
+
+    // say: the text the two lines of the game mod carry instead of what is really spoken, and how long the text
+    // the script names for the subtitle stays valid (a long sentence takes a while to speak)
+    constexpr std::string_view OWN_LINE_TEXT = "...";
+    constexpr std::int64_t SAY_TEXT_SECONDS = 90;
+
+    // Surroundings: rays through the physics of the game tell what is around a character.
+    // In how many directions (spread evenly, the first one straight ahead) and how many numbers go out per direction
+    constexpr std::int32_t SURROUNDING_DIRECTIONS = 8;
+    // What a ray found within the range: nothing, something upright (a wall, a rock, a tree), or ground that rises
+    constexpr std::int32_t OBSTACLE_NONE = 0;
+    constexpr std::int32_t OBSTACLE_WALL = 1;
+    constexpr std::int32_t OBSTACLE_SLOPE = 2;
+    constexpr std::int32_t NO_DROP = -1;
+    constexpr std::int32_t DEFAULT_SURROUNDINGS_METERS = 15;
+    constexpr std::int32_t MAX_SURROUNDINGS_METERS = 30;
+    // The rays start at chest height, outside the body of the character
+    constexpr float RAY_HEIGHT_UNITS = 90.0f;
+    constexpr float RAY_START_UNITS = 30.0f;
+    // A surface whose normal points up at least this much is ground one can walk on, not a wall
+    constexpr float WALKABLE_NORMAL_UP = 0.6f;
+    // Looking for a drop: every so far along a direction a ray goes down. Ground that lies more than DROP_HEIGHT_UNITS
+    // lower than at the step before (or no ground within DROP_PROBE_UNITS) is a drop
+    constexpr float DROP_STEP_UNITS = 140.0f;
+    constexpr float DROP_PROBE_UNITS = 700.0f;
+    constexpr float DROP_HEIGHT_UNITS = 150.0f;
+    // A ray that meets something that is no obstacle (a character, a trigger, loose clutter) goes on behind it,
+    // this far behind the hit and at most this often
+    constexpr float RAY_PASS_STEP_UNITS = 10.0f;
+    constexpr std::int32_t MAX_RAY_PASSES = 6;
+    // Game units into the units of the physics of the game, if the Address Library cannot tell
+    constexpr float DEFAULT_PHYSICS_SCALE = 0.0142875f;
 
     // Functions of the game this plugin calls through the Address Library, by their IDs for Skyrim SE (which Skyrim VR shares).
     // The Address Library for Skyrim VR is a file that grows from release to release, and an ID it does not have
     // ends the game with an error. So the plugin looks into the file first (see HasGameAddress)
     constexpr std::uint64_t CONDITION_IS_TRUE_ID = 29074;
     constexpr std::uint64_t WORLD_SINGLETON_ID = 516923;
+    constexpr std::uint64_t CELL_PHYSICS_ID = 18536;
+    constexpr std::uint64_t PHYSICS_SCALE_ID = 231896;
+    constexpr std::uint64_t PHYSICS_LOCK_ID = 66976;
+    constexpr std::uint64_t PHYSICS_UNLOCK_ID = 66982;
+    constexpr std::uint64_t DISABLE_REFERENCE_ID = 19373;
     // The file name is these two parts around the version of the game, eg "1-4-15-0"
     constexpr std::string_view ADDRESS_FILE_START = "Data/SKSE/Plugins/version-";
     constexpr std::string_view ADDRESS_FILE_END = ".csv";
@@ -799,16 +847,51 @@ namespace Companion {
         }
     }
 
+    // The model file of scenery, in small letters and with backslashes, or an empty text for everything else
+    std::string GetSceneryModel(const RE::TESBoundObject* base, bool withActivators) {
+        const RE::TESModel* model = base->As<RE::TESObjectSTAT>();
+        if (!model) model = base->As<RE::BGSMovableStatic>();
+        if (!model && withActivators) model = base->As<RE::TESObjectACTI>();
+        if (!model) return std::string();
+        std::string lowered(ViewOf(model->GetModel()));
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char letter) {
+            return letter == '/' ? '\\' : static_cast<char>(std::tolower(letter));
+        });
+        return lowered;
+    }
+
+    // Which kind of trap this is (the folder its model lies in, see TRAP_MODEL_FOLDER), or an empty text if it is none
+    std::string GetTrapKind(const RE::TESBoundObject* base) {
+        const std::string model = GetSceneryModel(base, true);
+        std::size_t start = std::string::npos;
+        if (model.starts_with(TRAP_MODEL_FOLDER)) {
+            start = TRAP_MODEL_FOLDER.size();
+        } else {
+            const auto inside = model.find(std::string("\\") + std::string(TRAP_MODEL_FOLDER));
+            if (inside != std::string::npos) start = inside + 1 + TRAP_MODEL_FOLDER.size();
+        }
+        if (start == std::string::npos) return std::string();
+        // Below the folder of the traps comes the folder of the kind. A model right in the folder goes by its file name
+        auto end = model.find('\\', start);
+        if (end == std::string::npos) end = model.find('.', start);
+        return CleanText(std::string_view(model).substr(start, end == std::string::npos ? std::string::npos : end - start));
+    }
+
+    // The ammunition an arrow in the world gives back, or nullptr if the reference is no arrow that has come to rest
+    RE::TESAmmo* GetRestingArrowAmmo(RE::TESObjectREFR* reference) {
+        auto* arrow = reference ? reference->As<RE::ArrowProjectile>() : nullptr;
+        if (!arrow || arrow->IsDisabled() || arrow->IsMarkedForDeletion()) return nullptr;
+        const auto& flight = arrow->GetProjectileRuntimeData();
+        if (!flight.ammoSource) return nullptr;
+        if (flight.impacts.empty() && flight.linearVelocity.Length() > RESTING_ARROW_SPEED) return nullptr;
+        return flight.ammoSource;
+    }
+
     // Whether this is the scenery the game builds its tables from (see TABLE_MODEL_WORD)
     bool IsTable(const RE::TESBoundObject* base) {
-        const RE::TESObjectSTAT* scenery = base->As<RE::TESObjectSTAT>();
-        if (!scenery) scenery = base->As<RE::BGSMovableStatic>();
-        if (!scenery) return false;
-        std::string_view fileName = ViewOf(scenery->GetModel());
-        const auto lastSeparator = fileName.find_last_of("\\/");
-        if (lastSeparator != std::string_view::npos) fileName.remove_prefix(lastSeparator + 1);
-        std::string lowered(fileName);
-        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char letter) { return static_cast<char>(std::tolower(letter)); });
+        const std::string model = GetSceneryModel(base, false);
+        const auto lastSeparator = model.find_last_of('\\');
+        const std::string lowered = lastSeparator == std::string::npos ? model : model.substr(lastSeparator + 1);
         if (lowered.find(TABLE_MODEL_WORD) == std::string::npos) return false;
         for (const auto word : NOT_A_TABLE_MODEL_WORDS) {
             if (lowered.find(word) != std::string::npos) return false;
@@ -819,7 +902,8 @@ namespace Companion {
     // The things within the radius around the viewer: of every kind the nearest ones, at most limitPerKind,
     // furniture first, then containers, then items. Things without a name are left out (the game has many
     // invisible pieces of furniture that only tell characters where to lean or stand), except for tables,
-    // which go out as furniture under the name TABLE_NAME
+    // which go out as furniture under the name TABLE_NAME. Arrows that were shot and lie or stick somewhere
+    // go out as items under the name of their ammunition
     std::vector<Thing> CollectThings(RE::Actor* viewer, float radius, std::size_t limitPerKind) {
         std::array<std::vector<Thing>, THING_KIND_COUNT> thingsByKind;
         const auto own = viewer->GetPosition();
@@ -830,10 +914,11 @@ namespace Companion {
             }
             const auto* base = reference->GetBaseObject();
             if (!base) return RE::BSContainer::ForEachResult::kContinue;
-            const bool isTable = IsTable(base);
-            const std::int32_t kind = isTable ? THING_IS_FURNITURE : GetThingKind(base);
+            const auto* arrowAmmo = GetRestingArrowAmmo(reference);
+            const bool isTable = !arrowAmmo && IsTable(base);
+            const std::int32_t kind = arrowAmmo ? THING_IS_ITEM : (isTable ? THING_IS_FURNITURE : GetThingKind(base));
             if (kind < 0) return RE::BSContainer::ForEachResult::kContinue;
-            std::string name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            std::string name = CleanText(ViewOf(arrowAmmo ? arrowAmmo->GetName() : reference->GetDisplayFullName()));
             if (name.empty() && isTable) name = TABLE_NAME;
             if (name.empty()) return RE::BSContainer::ForEachResult::kContinue;
 
@@ -872,6 +957,112 @@ namespace Companion {
         }
         return things;
     }
+
+    // The traps within the radius around the viewer, nearest first, at most limit. Each part of a trap is a thing
+    // of its own for the game (the tripwire, the mace it lets loose), and each goes out
+    std::vector<Thing> CollectTraps(RE::Actor* viewer, float radius, std::size_t limit) {
+        std::vector<Thing> traps;
+        const auto own = viewer->GetPosition();
+        ForEachReferenceAround(viewer, radius, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference->IsDisabled() || reference->IsMarkedForDeletion()) return RE::BSContainer::ForEachResult::kContinue;
+            const auto* base = reference->GetBaseObject();
+            if (!base) return RE::BSContainer::ForEachResult::kContinue;
+            std::string trapKind = GetTrapKind(base);
+            if (trapKind.empty()) return RE::BSContainer::ForEachResult::kContinue;
+            Thing trap;
+            trap.kind = THING_IS_TRAP;
+            trap.referenceID = reference->GetFormID();
+            trap.name = std::move(trapKind);
+            trap.distance = own.GetDistance(reference->GetPosition());
+            trap.view = GetViewFrom(viewer, reference->GetPosition());
+            traps.push_back(std::move(trap));
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        std::sort(traps.begin(), traps.end(), [](const Thing& left, const Thing& right) { return left.distance < right.distance; });
+        if (traps.size() > limit) traps.resize(limit);
+        return traps;
+    }
+
+    // One thing as the text the script gets: kind, ref ID as eight hex digits, distance to the viewer in meters,
+    // angle from where the viewer faces in degrees (negative = left), a flag that depends on the kind, name
+    std::string GetThingLine(const Thing& thing) {
+        std::string line = std::to_string(thing.kind);
+        line += FIELD_SEPARATOR;
+        line += std::format("{:08X}", thing.referenceID);
+        line += FIELD_SEPARATOR;
+        line += std::to_string(thing.view.distanceMeters);
+        line += FIELD_SEPARATOR;
+        line += std::to_string(thing.view.angleDegrees);
+        line += FIELD_SEPARATOR;
+        line += std::to_string(thing.flags);
+        line += FIELD_SEPARATOR;
+        line += thing.name;
+        return line;
+    }
+
+    // ------------------------------------------------------------ surroundings
+    // What is around a character, found by rays through the physics of the game: how far it is to the next wall
+    // in each direction, whether the ground only rises there, and where the ground drops away.
+    // The rays go from the character, so it does not matter where the player or the camera is
+
+    struct RayHit {
+        bool isHit = false;
+        // From the start of the ray, in game units
+        float distance = 0.0f;
+        // How much the surface that was hit faces upwards: 1 = flat ground, 0 = an upright wall
+        float normalUp = 0.0f;
+    };
+
+    // Whether something in this layer of the physics stops a walking character for good: the world itself,
+    // not characters, loose things, triggers or the zones the game puts around things
+    bool IsSolidLayer(RE::COL_LAYER layer) {
+        switch (layer) {
+            case RE::COL_LAYER::kUnidentified:
+            case RE::COL_LAYER::kStatic:
+            case RE::COL_LAYER::kAnimStatic:
+            case RE::COL_LAYER::kTransparent:
+            case RE::COL_LAYER::kTrees:
+            case RE::COL_LAYER::kProps:
+            case RE::COL_LAYER::kTerrain:
+            case RE::COL_LAYER::kGround:
+            case RE::COL_LAYER::kInvisibleWall:
+            case RE::COL_LAYER::kStairHelper:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Sends a ray from one point to another (both in game units) and returns the first solid thing in its way
+    RayHit CastRay(RE::bhkWorld* physics, float scale, const RE::NiPoint3& from, const RE::NiPoint3& to) {
+        RayHit result;
+        const RE::NiPoint3 whole = to - from;
+        const float length = whole.Length();
+        if (length <= 0.0f) return result;
+        const RE::NiPoint3 direction = whole / length;
+        float covered = 0.0f;
+        for (std::int32_t pass = 0; pass < MAX_RAY_PASSES && covered < length; ++pass) {
+            const RE::NiPoint3 start = from + direction * covered;
+            RE::bhkPickData pick;
+            pick.rayInput.from = RE::hkVector4(start.x * scale, start.y * scale, start.z * scale, 0.0f);
+            pick.rayInput.to = RE::hkVector4(to.x * scale, to.y * scale, to.z * scale, 0.0f);
+            physics->PickObject(pick);
+            if (!pick.rayOutput.HasHit()) return result;
+            const float hitDistance = covered + pick.rayOutput.hitFraction * (length - covered);
+            if (IsSolidLayer(pick.rayOutput.rootCollidable->GetCollisionLayer())) {
+                float normal[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                _mm_storeu_ps(normal, pick.rayOutput.normal.quad);
+                result.isHit = true;
+                result.distance = hitDistance;
+                result.normalUp = normal[2];
+                return result;
+            }
+            covered = hitDistance + RAY_PASS_STEP_UNITS;
+        }
+        return result;
+    }
+
+    std::int32_t ToWholeMeters(float gameUnits) { return static_cast<std::int32_t>(std::lround(gameUnits / GAME_UNITS_PER_METER)); }
 
     // ---------------------------------------------------------------- hearing
     // The game calls SubtitleManager::ShowSubtitle for every line a character near the player speaks and it would
@@ -975,9 +1166,36 @@ namespace Companion {
         lastChoiceText.clear();
     }
 
+    // say: what the companion really says, told by the script (see SetSayText), for whom, and since when
+    std::mutex sayLock;
+    RE::FormID saySpeakerID = 0;
+    std::string sayText;
+    std::chrono::steady_clock::time_point sayTime;
+
+    // The subtitle to show for a line: what the script named if this is the own line of the game mod spoken by the
+    // character the script named (then the text is put into shown and that is handed out), otherwise the subtitle itself
+    const char* PickShownSubtitle(RE::TESObjectREFR* speaker, const char* subtitle, std::string& shown) noexcept {
+        try {
+            if (!speaker || !subtitle) return subtitle;
+            const auto text = ViewOf(subtitle);
+            const auto first = text.find_first_not_of(" \t\r\n");
+            const auto last = text.find_last_not_of(" \t\r\n");
+            if (first == std::string_view::npos || text.substr(first, last - first + 1) != OWN_LINE_TEXT) return subtitle;
+            const std::lock_guard<std::mutex> guard(sayLock);
+            if (sayText.empty() || speaker->GetFormID() != saySpeakerID) return subtitle;
+            if (SecondsBetween(sayTime, std::chrono::steady_clock::now()) > SAY_TEXT_SECONDS) return subtitle;
+            shown = sayText;
+            return shown.c_str();
+        } catch (...) {
+            return subtitle;
+        }
+    }
+
     struct SubtitleHook {
         static void Thunk(RE::SubtitleManager* manager, RE::TESObjectREFR* speaker, const char* subtitle, bool alwaysDisplay) {
-            original(manager, speaker, subtitle, alwaysDisplay);
+            std::string shown;
+            original(manager, speaker, PickShownSubtitle(speaker, subtitle, shown), alwaysDisplay);
+            // What goes to the script stays the line as the game had it, so that the companion does not hear itself
             OnSubtitle(speaker, subtitle);
         }
         static inline REL::Relocation<decltype(Thunk)> original;
@@ -1360,22 +1578,121 @@ namespace Companion {
         const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_THING_RADIUS_METERS) * GAME_UNITS_PER_METER;
         const std::size_t limit = maxPerKind > 0 ? static_cast<std::size_t>(maxPerKind) : DEFAULT_MAX_THINGS_PER_KIND;
 
-        for (const auto& thing : CollectThings(viewer, radius, limit)) {
-            std::string line = std::to_string(thing.kind);
-            line += FIELD_SEPARATOR;
-            line += std::format("{:08X}", thing.referenceID);
-            line += FIELD_SEPARATOR;
-            line += std::to_string(thing.view.distanceMeters);
-            line += FIELD_SEPARATOR;
-            line += std::to_string(thing.view.angleDegrees);
-            line += FIELD_SEPARATOR;
-            line += std::to_string(thing.flags);
-            line += FIELD_SEPARATOR;
-            line += thing.name;
-            lines.push_back(std::move(line));
-        }
+        for (const auto& thing : CollectThings(viewer, radius, limit)) lines.push_back(GetThingLine(thing));
         logger::debug("GetNearbyThings: {} things sent", lines.size());
         return lines;
+    }
+
+    // The traps close to the viewer (origin, or the player - see GetViewer), nearest first, at most maxTraps within
+    // radiusMeters. One text per trap, built like the lines of GetNearbyThings: kind (always 3), ref ID, distance,
+    // angle, 0, and as the name the kind of trap as the game files it (tripwire, pressureplate, beartrap, macetrap ...)
+    std::vector<std::string> GetNearbyTraps(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxTraps, RE::Actor* origin) {
+        std::vector<std::string> lines;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return lines;
+        auto* viewer = GetViewer(origin, player);
+        const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_TRAP_RADIUS_METERS) * GAME_UNITS_PER_METER;
+        const std::size_t limit = maxTraps > 0 ? static_cast<std::size_t>(maxTraps) : DEFAULT_MAX_TRAPS;
+        for (const auto& trap : CollectTraps(viewer, radius, limit)) lines.push_back(GetThingLine(trap));
+        return lines;
+    }
+
+    // The reference with this ID (given in its upper and lower 16 bits, as the companion server sends IDs), or nullptr
+    RE::TESObjectREFR* FindReference(std::int32_t highHalf, std::int32_t lowHalf) {
+        const RE::FormID wantedID = (static_cast<RE::FormID>(highHalf & 0xFFFF) << 16) | static_cast<RE::FormID>(lowHalf & 0xFFFF);
+        auto* form = wantedID != 0 ? RE::TESForm::LookupByID(wantedID) : nullptr;
+        return form ? form->AsReference() : nullptr;
+    }
+
+    // The name of the ammunition if the reference with this ID is an arrow that was shot and has come to rest,
+    // otherwise an empty text. Such an arrow is no item for the game, so scripts cannot take it like one
+    std::string GetRestingArrowName(RE::StaticFunctionTag*, std::int32_t highHalf, std::int32_t lowHalf) {
+        const auto* ammo = GetRestingArrowAmmo(FindReference(highHalf, lowHalf));
+        return ammo ? CleanText(ViewOf(ammo->GetName())) : std::string();
+    }
+
+    // Gives the taker the ammunition of an arrow that has come to rest and takes the arrow out of the world.
+    // Returns the name of the ammunition, or an empty text if there is no such arrow (any more).
+    // The game does the giving and taking a moment later, on its own thread
+    std::string TakeRestingArrow(RE::StaticFunctionTag*, RE::Actor* taker, std::int32_t highHalf, std::int32_t lowHalf) {
+        auto* arrow = FindReference(highHalf, lowHalf);
+        auto* ammo = GetRestingArrowAmmo(arrow);
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!taker || !ammo || !tasks || !HasGameAddress(DISABLE_REFERENCE_ID)) return std::string();
+        const RE::FormID arrowID = arrow->GetFormID();
+        const RE::FormID takerID = taker->GetFormID();
+        tasks->AddTask([arrowID, takerID]() {
+            auto* takerNow = RE::TESForm::LookupByID<RE::Actor>(takerID);
+            auto* arrowForm = RE::TESForm::LookupByID(arrowID);
+            auto* arrowNow = arrowForm ? arrowForm->AsReference() : nullptr;
+            // Someone else may have taken the arrow in the meantime
+            auto* ammoNow = GetRestingArrowAmmo(arrowNow);
+            if (!takerNow || !ammoNow) return;
+            takerNow->AddObjectToContainer(ammoNow, nullptr, 1, nullptr);
+            arrowNow->Disable();
+        });
+        return CleanText(ViewOf(ammo->GetName()));
+    }
+
+    // say: tells what the speaker really says with its next line, so that the subtitle of the own line of the game mod
+    // shows that instead of "...". An empty text ends it. Returns whether subtitles can be changed at all
+    bool SetSayText(RE::StaticFunctionTag*, RE::Actor* speaker, RE::BSFixedString text) {
+        const std::lock_guard<std::mutex> guard(sayLock);
+        saySpeakerID = speaker ? speaker->GetFormID() : 0;
+        sayText = speaker ? CleanText(ViewOf(text.c_str()), MAX_HEARD_TEXT_LENGTH) : std::string();
+        sayTime = std::chrono::steady_clock::now();
+        return isHearing;
+    }
+
+    // What is around the character within rangeMeters, by rays (see CastRay). SURROUNDING_DIRECTIONS directions,
+    // the first straight ahead of the character, the others clockwise from there, three numbers each:
+    // what the ray met (0 = nothing, 1 = a wall or another upright obstacle, 2 = ground that rises),
+    // how far away in meters (0 if nothing), and after how many meters the ground drops away (-1 = it does not,
+    // as far as the ray got). An empty list if the game cannot tell (the character is not in the loaded area)
+    std::vector<std::int32_t> GetSurroundings(RE::StaticFunctionTag*, RE::Actor* origin, std::int32_t rangeMeters) {
+        std::vector<std::int32_t> values;
+        if (!origin || !origin->Is3DLoaded()) return values;
+        if (!HasGameAddress(CELL_PHYSICS_ID) || !HasGameAddress(PHYSICS_LOCK_ID) || !HasGameAddress(PHYSICS_UNLOCK_ID)) return values;
+        const auto* cell = origin->GetParentCell();
+        auto* physics = cell ? cell->GetbhkWorld() : nullptr;
+        if (!physics) return values;
+        const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+        const std::int32_t meters = rangeMeters > 0 ? std::min(rangeMeters, MAX_SURROUNDINGS_METERS) : DEFAULT_SURROUNDINGS_METERS;
+        const float range = static_cast<float>(meters) * GAME_UNITS_PER_METER;
+        const RE::NiPoint3 feet = origin->GetPosition();
+        const RE::NiPoint3 chest(feet.x, feet.y, feet.z + RAY_HEIGHT_UNITS);
+        const float facing = origin->GetAngleZ();
+
+        const RE::BSReadLockGuard guard(physics->worldLock);
+        for (std::int32_t index = 0; index < SURROUNDING_DIRECTIONS; ++index) {
+            // The game counts directions clockwise from north, and north is where y grows
+            const float heading = facing + static_cast<float>(index) * 2.0f * std::numbers::pi_v<float> / static_cast<float>(SURROUNDING_DIRECTIONS);
+            const RE::NiPoint3 step(std::sin(heading), std::cos(heading), 0.0f);
+            const RayHit ahead = CastRay(physics, scale, chest + step * RAY_START_UNITS, chest + step * range);
+            std::int32_t obstacle = OBSTACLE_NONE;
+            float reach = range;
+            if (ahead.isHit) {
+                obstacle = ahead.normalUp >= WALKABLE_NORMAL_UP ? OBSTACLE_SLOPE : OBSTACLE_WALL;
+                reach = RAY_START_UNITS + ahead.distance;
+            }
+            // Along the free stretch: does the ground fall away somewhere?
+            std::int32_t dropMeters = NO_DROP;
+            float groundBefore = feet.z;
+            for (float along = DROP_STEP_UNITS; along < reach; along += DROP_STEP_UNITS) {
+                const RE::NiPoint3 top = chest + step * along;
+                const RayHit below = CastRay(physics, scale, top, RE::NiPoint3(top.x, top.y, top.z - DROP_PROBE_UNITS));
+                const float ground = below.isHit ? top.z - below.distance : top.z - DROP_PROBE_UNITS;
+                if (!below.isHit || groundBefore - ground > DROP_HEIGHT_UNITS) {
+                    dropMeters = ToWholeMeters(along);
+                    break;
+                }
+                groundBefore = ground;
+            }
+            values.push_back(obstacle);
+            values.push_back(obstacle == OBSTACLE_NONE ? 0 : ToWholeMeters(reach));
+            values.push_back(dropMeters);
+        }
+        return values;
     }
 
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
@@ -1390,6 +1707,11 @@ namespace Companion {
         vm->RegisterFunction("GetDoorDestination", SCRIPT_NAME, GetDoorDestination);
         vm->RegisterFunction("GetDoorArrival", SCRIPT_NAME, GetDoorArrival);
         vm->RegisterFunction("GetCharactersInCell", SCRIPT_NAME, GetCharactersInCell);
+        vm->RegisterFunction("GetNearbyTraps", SCRIPT_NAME, GetNearbyTraps);
+        vm->RegisterFunction("GetRestingArrowName", SCRIPT_NAME, GetRestingArrowName);
+        vm->RegisterFunction("TakeRestingArrow", SCRIPT_NAME, TakeRestingArrow);
+        vm->RegisterFunction("SetSayText", SCRIPT_NAME, SetSayText);
+        vm->RegisterFunction("GetSurroundings", SCRIPT_NAME, GetSurroundings);
         return true;
     }
 
@@ -1409,6 +1731,12 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     }
     if (!Companion::HasGameAddress(Companion::WORLD_SINGLETON_ID)) {
         logger::warn("The Address Library has no ID {}: no doors among the places and no things around.", Companion::WORLD_SINGLETON_ID);
+    }
+    for (const auto wantedID : {Companion::CELL_PHYSICS_ID, Companion::PHYSICS_LOCK_ID, Companion::PHYSICS_UNLOCK_ID}) {
+        if (!Companion::HasGameAddress(wantedID)) logger::warn("The Address Library has no ID {}: no rays to tell the surroundings.", wantedID);
+    }
+    if (!Companion::HasGameAddress(Companion::DISABLE_REFERENCE_ID)) {
+        logger::warn("The Address Library has no ID {}: arrows that were shot cannot be picked up.", Companion::DISABLE_REFERENCE_ID);
     }
     if (const auto* messaging = SKSE::GetMessagingInterface()) {
         messaging->RegisterListener("SKSE", Companion::OnMessage);
