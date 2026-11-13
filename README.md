@@ -24,6 +24,9 @@ string[] Function GetQuestTargets(int maxQuests, int maxTargets, Actor origin) g
 string[] Function GetNearbyPlaces(int radiusMeters, int maxMarkers, int maxDoors, Actor origin) global native
 string[] Function GetNearbyThings(int radiusMeters, int maxPerKind, Actor origin) global native
 string Function GetVoiceTypeName(Actor target) global native
+ObjectReference Function GetDoorDestination(ObjectReference door) global native
+float[] Function GetDoorArrival(ObjectReference door) global native
+string[] Function GetCharactersInCell(Actor origin, int maxCharacters) global native
 ```
 
 `GetOpenQuests` returns one text per quest, its parts separated by tabs: tracked (1 or 0), type of the quest, name of the quest, then the text of each open objective.
@@ -40,7 +43,11 @@ The last three functions see everything from `origin` (the viewer): distances, a
 
 `GetVoiceTypeName` returns the name of the voice of a character (the editor ID of its voice type, eg `FemaleEvenToned`), which is also the name of the folder the game looks in for the sound of what the character says.
 
-For the subtitles the plugin hooks into two calls of the game. A line `HearSubtitles=0` in `Data\SKSE\Plugins\KI_MCP_Gefaehrte.ini` switches that off.
+`GetDoorDestination` returns the door on the other side of a door that leads into another area, `GetDoorArrival` where someone stands after going through it (seen from that other door: east, north, up, and the direction faced).
+
+`GetCharactersInCell` returns the characters in the building `origin` is in while the player is somewhere else, one text per character: ref ID, distance in meters, angle, dead, name. The game has not loaded such a place, so these are only the characters it keeps in memory. The three functions with `origin` work there in the same way.
+
+For the subtitles the plugin searches the code of the game for every call of `SubtitleManager::ShowSubtitle` and redirects them through its own function (if that search fails, only the two calls mantella-vanilla-dialogue knows). The game only shows a character's line as a subtitle if that kind of subtitle is switched on in its settings, and in a test the plugin only heard lines then. A line `HearSubtitles=0` in `Data\SKSE\Plugins\KI_MCP_Gefaehrte.ini` switches that off.
 
 ## Credits
 

@@ -19,6 +19,7 @@
 #include <deque>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <numbers>
 #include <string>
@@ -33,7 +34,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 6;
+    constexpr std::int32_t INTERFACE_VERSION = 7;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -41,6 +42,8 @@ namespace Companion {
     // In bytes. Longer texts are cut off
     constexpr std::size_t MAX_TEXT_LENGTH = 200;
     constexpr std::size_t DEFAULT_MAX_QUESTS = 25;
+    // At most this many characters of a building that is not loaded, if the script names no number
+    constexpr std::size_t DEFAULT_MAX_CHARACTERS = 30;
     constexpr std::string_view CUT_OFF_MARK = "...";
 
     // What was heard and not fetched by the script yet. Older lines make room for newer ones
@@ -49,8 +52,11 @@ namespace Companion {
     constexpr std::size_t MAX_HEARD_TEXT_LENGTH = 300;
     // Lines older than this are not handed out any more
     constexpr std::int64_t MAX_HEARD_AGE_SECONDS = 600;
-    // The same line of the same speaker within this time counts as one
-    constexpr std::int64_t SAME_LINE_SECONDS = 20;
+    // The same line of the same speaker within this time counts as one. The game hands a line over again
+    // when it shows it again (eg after a menu was closed), so this is longer than a line takes to speak
+    constexpr std::int64_t SAME_LINE_SECONDS = 60;
+    // How many lines the plugin remembers to tell a repeated line apart, also after the script has fetched them
+    constexpr std::size_t MAX_REMEMBERED_LINES = 60;
 
     // A line "HearSubtitles=0" in this file (seen from the folder of the game) keeps the plugin from hooking into the game
     constexpr char SETTINGS_FILE[] = "Data\\SKSE\\Plugins\\KI_MCP_Gefaehrte.ini";
@@ -68,11 +74,20 @@ namespace Companion {
     // SubtitleManager::ShowSubtitle itself
     constexpr std::uint64_t SHOW_SUBTITLE_ID_SE = 51753;
     constexpr std::uint64_t SHOW_SUBTITLE_ID_AE = 52626;
-    // A call to a fixed address is the byte E8 followed by the distance to the target as four bytes
+    // A call to a fixed address is the byte E8 followed by the distance to the target as four bytes.
+    // A jump to a fixed address looks the same with the byte E9
     constexpr std::uint8_t DIRECT_CALL_BYTE = 0xE8;
+    constexpr std::uint8_t DIRECT_JUMP_BYTE = 0xE9;
     constexpr std::size_t DIRECT_CALL_LENGTH = 5;
     // Each redirected call needs 14 bytes of the trampoline
-    constexpr std::size_t TRAMPOLINE_BYTES = 64;
+    constexpr std::size_t TRAMPOLINE_BYTES_PER_CALL = 14;
+    constexpr std::size_t TRAMPOLINE_SPARE_BYTES = 16;
+    // The game calls ShowSubtitle from a handful of places. Far more than that found in its code would mean
+    // that the search went wrong, and then only the two known places are used
+    constexpr std::size_t MAX_SUBTITLE_CALLS = 16;
+    // A jump back to the start of ShowSubtitle from inside ShowSubtitle would be no call from outside.
+    // The function is far shorter than this, so nothing this close behind its start is touched
+    constexpr std::uintptr_t SUBTITLE_FUNCTION_REACH = 0x800;
     constexpr std::string_view UNKNOWN_VALUE = "?";
 
     // Distances go to the script in meters. One meter is about 70 game units
@@ -551,17 +566,37 @@ namespace Companion {
         return nullptr;
     }
 
+    // Whether a character is inside a building (or cave ...) the player is not in. The game has not loaded that place
+    // then: the character has no body, and of the place the game only keeps in memory what it always keeps
+    // (the characters who live there, the doors, and little else)
+    bool IsInUnloadedInterior(const RE::Actor* character, const RE::PlayerCharacter* player) {
+        if (!character || character->Is3DLoaded()) return false;
+        const auto* cell = GetCellOf(character);
+        return cell && cell->IsInteriorCell() && cell != GetCellOf(player);
+    }
+
+    // Goes through what is around the viewer. If the viewer stands in the loaded area, that is what the game has loaded
+    // around it. If it is inside a building the player is not in, it is what the game keeps of that building in memory
+    void ForEachReferenceAround(RE::Actor* viewer, float radius, const std::function<RE::BSContainer::ForEachResult(RE::TESObjectREFR*)>& callback) {
+        if (viewer->Is3DLoaded()) {
+            if (!HasGameAddress(WORLD_SINGLETON_ID)) return;
+            auto* world = RE::TES::GetSingleton();
+            if (world) world->ForEachReferenceInRange(viewer, radius, callback);
+            return;
+        }
+        const auto* cell = GetCellOf(viewer);
+        if (cell && cell->IsInteriorCell()) cell->ForEachReferenceInRange(viewer->GetPosition(), radius, callback);
+    }
+
     // A door in the loaded area around the viewer that leads straight into this cell, the nearest one, or nullptr.
     // For targets inside a building of the town the player stands in, if the game has no way to the target at hand
     const RE::TESObjectREFR* FindLoadedDoorInto(const RE::TESObjectCELL* targetCell, RE::Actor* viewer) {
-        if (!targetCell || !targetCell->IsInteriorCell() || !HasGameAddress(WORLD_SINGLETON_ID)) return nullptr;
-        auto* world = RE::TES::GetSingleton();
-        if (!world) return nullptr;
+        if (!targetCell || !targetCell->IsInteriorCell()) return nullptr;
         const auto own = viewer->GetPosition();
         const RE::TESObjectREFR* nearestDoor = nullptr;
         float nearestDistance = 0.0f;
 
-        world->ForEachReferenceInRange(viewer, static_cast<float>(DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER, [&](RE::TESObjectREFR* reference) {
+        ForEachReferenceAround(viewer, static_cast<float>(DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER, [&](RE::TESObjectREFR* reference) {
             if (!reference || reference->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
             const auto* base = reference->GetBaseObject();
             if (!base || !base->Is(RE::FormType::Door)) return RE::BSContainer::ForEachResult::kContinue;
@@ -698,12 +733,9 @@ namespace Companion {
     // The doors in the loaded area around the viewer that lead into another area (a building, a cave, out of town)
     std::vector<Place> CollectDoors(RE::Actor* viewer, float radius, std::size_t limit) {
         std::vector<Place> places;
-        if (!HasGameAddress(WORLD_SINGLETON_ID)) return places;
-        auto* world = RE::TES::GetSingleton();
-        if (!world) return places;
         const auto own = viewer->GetPosition();
 
-        world->ForEachReferenceInRange(viewer, radius, [&](RE::TESObjectREFR* reference) {
+        ForEachReferenceAround(viewer, radius, [&](RE::TESObjectREFR* reference) {
             if (!reference || reference->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
             const auto* base = reference->GetBaseObject();
             if (!base || !base->Is(RE::FormType::Door)) return RE::BSContainer::ForEachResult::kContinue;
@@ -765,12 +797,9 @@ namespace Companion {
     // invisible pieces of furniture that only tell characters where to lean or stand)
     std::vector<Thing> CollectThings(RE::Actor* viewer, float radius, std::size_t limitPerKind) {
         std::array<std::vector<Thing>, THING_KIND_COUNT> thingsByKind;
-        if (!HasGameAddress(WORLD_SINGLETON_ID)) return {};
-        auto* world = RE::TES::GetSingleton();
-        if (!world) return {};
         const auto own = viewer->GetPosition();
 
-        world->ForEachReferenceInRange(viewer, radius, [&](RE::TESObjectREFR* reference) {
+        ForEachReferenceAround(viewer, radius, [&](RE::TESObjectREFR* reference) {
             if (!reference || reference == viewer || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
                 return RE::BSContainer::ForEachResult::kContinue;
             }
@@ -817,8 +846,10 @@ namespace Companion {
     }
 
     // ---------------------------------------------------------------- hearing
-    // The game calls SubtitleManager::ShowSubtitle for every line a character near the player speaks.
-    // The plugin redirects the two calls through its own function, which passes the call on and keeps the line.
+    // The game calls SubtitleManager::ShowSubtitle for every line a character near the player speaks and it would
+    // show as a subtitle: lines of a dialogue, and what characters say in passing (the game calls those "general subtitles").
+    // The plugin redirects the calls through its own function, which passes the call on and keeps the line.
+    // In a test the lines only arrived while both kinds of subtitles were switched on in the settings of the game.
     // The script fetches the kept lines when the companion server asks for the state.
 
     struct HeardLine {
@@ -830,6 +861,9 @@ namespace Companion {
 
     std::mutex heardLock;
     std::deque<HeardLine> heardLines;
+    // The lines that were kept last, without their texts being handed out from here. The script empties heardLines
+    // whenever it fetches them, and a line the game shows once more must not count as new then
+    std::deque<HeardLine> rememberedLines;
     // The choice in the dialogue menu that was kept last, so that it is kept only once
     const void* lastChoice = nullptr;
     std::string lastChoiceText;
@@ -845,16 +879,26 @@ namespace Companion {
         const auto now = std::chrono::steady_clock::now();
 
         const std::lock_guard<std::mutex> guard(heardLock);
-        for (const auto& known : heardLines) {
-            if (known.speakerID == speakerID && known.text == text && SecondsBetween(known.time, now) < SAME_LINE_SECONDS) return;
+        while (!rememberedLines.empty() && SecondsBetween(rememberedLines.front().time, now) >= SAME_LINE_SECONDS) rememberedLines.pop_front();
+        for (const auto& known : rememberedLines) {
+            if (known.speakerID == speakerID && known.text == text) return;
         }
         HeardLine line;
         line.speakerID = speakerID;
         line.speakerName = CleanText(speakerName);
         line.text = std::move(text);
         line.time = now;
+        rememberedLines.push_back(line);
+        while (rememberedLines.size() > MAX_REMEMBERED_LINES) rememberedLines.pop_front();
         heardLines.push_back(std::move(line));
         while (heardLines.size() > MAX_STORED_HEARD_LINES) heardLines.pop_front();
+    }
+
+    // Subtitles like "(Heavy breathing)" describe a sound. Nobody said anything there
+    bool IsSoundDescription(std::string_view subtitle) {
+        const auto first = subtitle.find_first_not_of(" \t\r\n");
+        const auto last = subtitle.find_last_not_of(" \t\r\n");
+        return first != std::string_view::npos && subtitle[first] == '(' && subtitle[last] == ')';
     }
 
     // While the dialogue menu is open, the line the player picked last is what the character answers to.
@@ -887,7 +931,7 @@ namespace Companion {
 
     void OnSubtitle(RE::TESObjectREFR* speaker, const char* subtitle) noexcept {
         try {
-            if (!speaker || !subtitle || subtitle[0] == '\0') return;
+            if (!speaker || !subtitle || subtitle[0] == '\0' || IsSoundDescription(subtitle)) return;
             KeepPlayerChoice();
             KeepHeardLine(speaker->GetFormID(), ViewOf(speaker->GetDisplayFullName()), subtitle);
         } catch (...) {
@@ -898,6 +942,7 @@ namespace Companion {
     void ForgetHeardLines() {
         const std::lock_guard<std::mutex> guard(heardLock);
         heardLines.clear();
+        rememberedLines.clear();
         lastChoice = nullptr;
         lastChoiceText.clear();
     }
@@ -934,37 +979,83 @@ namespace Companion {
         return address + DIRECT_CALL_LENGTH + distance;
     }
 
-    // Redirects the two calls of ShowSubtitle through SubtitleHook::Thunk.
-    // The places inside the two functions are known for Skyrim SE and AE. Before anything is changed, both places
-    // are checked: each has to be a call that goes to ShowSubtitle. If not (another version of the game,
-    // or another mod was there first), nothing is changed and the plugin only does without hearing
+    // All places in the code of the game that call ShowSubtitle (or jump to it) at a fixed address.
+    // The two places mantella-vanilla-dialogue knows only see the lines of dialogues. What characters say in passing
+    // reaches ShowSubtitle from elsewhere, so the code of the game is searched for every call that goes there.
+    // A call is five bytes: E8 (or E9 for a jump) and the distance to the target. Five bytes that only look like
+    // such a call by chance would have to hit this one address among four billion, so that does not happen in practice
+    std::vector<std::uintptr_t> FindCallsTo(std::uintptr_t target) {
+        std::vector<std::uintptr_t> calls;
+        const auto code = REL::Module::get().segment(REL::Segment::textx);
+        const std::uintptr_t start = code.address();
+        const std::size_t size = code.size();
+        if (start == 0 || size < DIRECT_CALL_LENGTH) return calls;
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(start);
+        for (std::size_t place = 0; place + DIRECT_CALL_LENGTH <= size; ++place) {
+            if (bytes[place] != DIRECT_CALL_BYTE && bytes[place] != DIRECT_JUMP_BYTE) continue;
+            std::int32_t distance = 0;
+            std::memcpy(&distance, bytes + place + 1, sizeof(distance));
+            if (start + place + DIRECT_CALL_LENGTH + distance != target) continue;
+            const std::uintptr_t site = start + place;
+            if (site >= target && site < target + SUBTITLE_FUNCTION_REACH) continue;
+            calls.push_back(site);
+        }
+        return calls;
+    }
+
+    // The two calls of ShowSubtitle that are known for Skyrim SE and AE, if both really are calls that go there.
+    // Otherwise (another version of the game, or another mod was there first) none
+    std::vector<std::uintptr_t> GetKnownSubtitleCalls(std::uintptr_t showSubtitle) {
+        const std::ptrdiff_t actorOffset = REL::Module::IsAE() ? ACTOR_SOUND_CALL_OFFSET_AE : ACTOR_SOUND_CALL_OFFSET_SE;
+        REL::Relocation<std::uintptr_t> referenceSite(RELOCATION_ID(REFERENCE_SOUND_ID_SE, REFERENCE_SOUND_ID_AE), REFERENCE_SOUND_CALL_OFFSET);
+        REL::Relocation<std::uintptr_t> actorSite(RELOCATION_ID(ACTOR_SOUND_ID_SE, ACTOR_SOUND_ID_AE), actorOffset);
+        const std::vector<std::uintptr_t> sites{ referenceSite.address(), actorSite.address() };
+        for (const auto site : sites) {
+            const auto target = GetDirectCallTarget(site);
+            if (target != showSubtitle) {
+                logger::error("No hearing: the call at {:X} goes to {:X} instead of ShowSubtitle at {:X}.", site, target, showSubtitle);
+                return {};
+            }
+        }
+        return sites;
+    }
+
+    // Redirects the calls of ShowSubtitle through SubtitleHook::Thunk: every call found in the code of the game,
+    // or only the two known ones if that search finds nothing believable. If neither works, nothing is changed
+    // and the plugin only does without hearing
     bool InstallSubtitleHook() {
         if (IsHearingSwitchedOff()) {
             logger::info("Hearing is switched off in {}.", SETTINGS_FILE);
             return false;
         }
-        const std::ptrdiff_t actorOffset = REL::Module::IsAE() ? ACTOR_SOUND_CALL_OFFSET_AE : ACTOR_SOUND_CALL_OFFSET_SE;
-        REL::Relocation<std::uintptr_t> referenceSite(RELOCATION_ID(REFERENCE_SOUND_ID_SE, REFERENCE_SOUND_ID_AE), REFERENCE_SOUND_CALL_OFFSET);
-        REL::Relocation<std::uintptr_t> actorSite(RELOCATION_ID(ACTOR_SOUND_ID_SE, ACTOR_SOUND_ID_AE), actorOffset);
         REL::Relocation<std::uintptr_t> showSubtitle(RELOCATION_ID(SHOW_SUBTITLE_ID_SE, SHOW_SUBTITLE_ID_AE));
-        const std::array<std::uintptr_t, 2> sites{ referenceSite.address(), actorSite.address() };
-
-        for (const auto site : sites) {
-            const auto target = GetDirectCallTarget(site);
-            if (target != showSubtitle.address()) {
-                logger::error("No hearing: the call at {:X} goes to {:X} instead of ShowSubtitle at {:X}. Nothing was changed.", site,
-                              target, showSubtitle.address());
-                return false;
-            }
+        auto sites = FindCallsTo(showSubtitle.address());
+        if (sites.empty() || sites.size() > MAX_SUBTITLE_CALLS) {
+            logger::warn("Hearing: the search found {} calls of ShowSubtitle, which is not believable. Using the two known ones.", sites.size());
+            sites = GetKnownSubtitleCalls(showSubtitle.address());
+            if (sites.empty()) return false;
         }
 
         auto& trampoline = SKSE::GetTrampoline();
+        const std::size_t neededBytes = sites.size() * TRAMPOLINE_BYTES_PER_CALL;
         // Older versions of SKSE (as the one for Skyrim VR) hand out no memory for this, so the plugin gets its own
-        if (trampoline.empty()) trampoline.create(TRAMPOLINE_BYTES);
-        for (const auto site : sites) {
-            SubtitleHook::original = trampoline.write_call<DIRECT_CALL_LENGTH>(site, SubtitleHook::Thunk);
+        if (trampoline.empty()) trampoline.create(neededBytes + TRAMPOLINE_SPARE_BYTES);
+        if (trampoline.free_size() < neededBytes) {
+            logger::error("No hearing: {} bytes are needed to redirect {} calls, only {} are free. Nothing was changed.", neededBytes,
+                          sites.size(), trampoline.free_size());
+            return false;
         }
-        logger::info("Hearing: hooked into the two calls of ShowSubtitle.");
+        for (const auto site : sites) {
+            const bool isJump = *reinterpret_cast<const std::uint8_t*>(site) == DIRECT_JUMP_BYTE;
+            // Every one of them went to ShowSubtitle, so what comes back is the same address each time
+            if (isJump) {
+                SubtitleHook::original = trampoline.write_branch<DIRECT_CALL_LENGTH>(site, SubtitleHook::Thunk);
+            } else {
+                SubtitleHook::original = trampoline.write_call<DIRECT_CALL_LENGTH>(site, SubtitleHook::Thunk);
+            }
+            logger::info("Hearing: redirected the {} at {:X} (offset {:X}).", isJump ? "jump" : "call", site, site - REL::Module::get().base());
+        }
+        logger::info("Hearing: hooked into {} calls of ShowSubtitle.", sites.size());
         return true;
     }
 
@@ -988,6 +1079,78 @@ namespace Companion {
         const auto* voice = base ? base->voiceType : nullptr;
         const char* name = voice ? voice->GetFormEditorID() : nullptr;
         return name ? RE::BSFixedString(name) : RE::BSFixedString();
+    }
+
+    // The door on the other side of a door that leads into another area (a building, a cave, out of town),
+    // or None if this is no such door
+    RE::TESObjectREFR* GetDoorDestination(RE::StaticFunctionTag*, RE::TESObjectREFR* door) {
+        const auto* teleport = door ? door->extraList.GetByType<RE::ExtraTeleport>() : nullptr;
+        const auto* link = teleport ? teleport->teleportData : nullptr;
+        if (!link) return nullptr;
+        return link->linkedDoor.get().get();
+    }
+
+    // Where someone stands after going through such a door, measured from the door on the other side
+    // (GetDoorDestination): how far to the east, to the north and upwards in game units, and the direction
+    // faced in degrees (0 = north, 90 = east). Empty if this is no such door
+    std::vector<float> GetDoorArrival(RE::StaticFunctionTag*, RE::TESObjectREFR* door) {
+        const auto* teleport = door ? door->extraList.GetByType<RE::ExtraTeleport>() : nullptr;
+        const auto* link = teleport ? teleport->teleportData : nullptr;
+        const auto otherDoor = link ? link->linkedDoor.get() : RE::NiPointer<RE::TESObjectREFR>();
+        if (!otherDoor) return {};
+        const auto offset = link->position - otherDoor->GetPosition();
+        return { offset.x, offset.y, offset.z, link->rotation.z * DEGREES_PER_RADIAN };
+    }
+
+    // The characters in the building the character "origin" is in while the player is somewhere else
+    // (see IsInUnloadedInterior), nearest first, at most maxCharacters. These are only the ones the game keeps
+    // in memory for a place that is not loaded: as a rule the named characters who live there, not bandits and animals.
+    // One text per character, its parts separated by tabs: ref ID as eight hex digits, distance to origin in meters,
+    // angle from where origin faces in degrees (negative = left), dead (1 or 0), name.
+    // Empty if origin is not in such a place
+    std::vector<std::string> GetCharactersInCell(RE::StaticFunctionTag*, RE::Actor* origin, std::int32_t maxCharacters) {
+        std::vector<std::string> lines;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !IsInUnloadedInterior(origin, player)) return lines;
+        const std::size_t limit = maxCharacters > 0 ? static_cast<std::size_t>(maxCharacters) : DEFAULT_MAX_CHARACTERS;
+
+        struct Character {
+            float distance = 0.0f;
+            std::string line;
+        };
+        std::vector<Character> characters;
+        const auto own = origin->GetPosition();
+        GetCellOf(origin)->ForEachReference([&](RE::TESObjectREFR* reference) {
+            if (!reference || reference == origin || reference == player || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            const auto* actor = reference->As<RE::Actor>();
+            if (!actor) return RE::BSContainer::ForEachResult::kContinue;
+            std::string name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            if (name.empty()) return RE::BSContainer::ForEachResult::kContinue;
+
+            Character character;
+            character.distance = own.GetDistance(reference->GetPosition());
+            const auto view = GetViewFrom(origin, reference->GetPosition());
+            character.line = std::format("{:08X}", reference->GetFormID());
+            character.line += FIELD_SEPARATOR;
+            character.line += std::to_string(view.distanceMeters);
+            character.line += FIELD_SEPARATOR;
+            character.line += std::to_string(view.angleDegrees);
+            character.line += FIELD_SEPARATOR;
+            character.line += actor->IsDead() ? "1" : "0";
+            character.line += FIELD_SEPARATOR;
+            character.line += name;
+            characters.push_back(std::move(character));
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        std::sort(characters.begin(), characters.end(), [](const Character& left, const Character& right) { return left.distance < right.distance; });
+        for (auto& character : characters) {
+            if (lines.size() >= limit) break;
+            lines.push_back(std::move(character.line));
+        }
+        logger::debug("GetCharactersInCell: {} characters sent", lines.size());
+        return lines;
     }
 
     // Whether the plugin could hook into the subtitles of the game (see InstallSubtitleHook)
@@ -1050,10 +1213,11 @@ namespace Companion {
         return lines;
     }
 
-    // From whom the lists for the script are seen: the character the script names, or the player if it names none
-    // or one that has no body in the loaded area
+    // From whom the lists for the script are seen: the character the script names if it stands in the loaded area
+    // or inside a building the player is not in. Otherwise (none named, or one somewhere far away outdoors) the player
     RE::Actor* GetViewer(RE::Actor* origin, RE::PlayerCharacter* player) {
-        if (origin && origin->Is3DLoaded() && !origin->IsDisabled()) return origin;
+        if (!origin || origin->IsDisabled()) return player;
+        if (origin->Is3DLoaded() || IsInUnloadedInterior(origin, player)) return origin;
         return player;
     }
 
@@ -1195,6 +1359,9 @@ namespace Companion {
         vm->RegisterFunction("GetNearbyPlaces", SCRIPT_NAME, GetNearbyPlaces);
         vm->RegisterFunction("GetNearbyThings", SCRIPT_NAME, GetNearbyThings);
         vm->RegisterFunction("GetVoiceTypeName", SCRIPT_NAME, GetVoiceTypeName);
+        vm->RegisterFunction("GetDoorDestination", SCRIPT_NAME, GetDoorDestination);
+        vm->RegisterFunction("GetDoorArrival", SCRIPT_NAME, GetDoorArrival);
+        vm->RegisterFunction("GetCharactersInCell", SCRIPT_NAME, GetCharactersInCell);
         return true;
     }
 
