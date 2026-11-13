@@ -34,7 +34,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 9;
+    constexpr std::int32_t INTERFACE_VERSION = 10;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -152,6 +152,23 @@ namespace Companion {
     // the script names for the subtitle stays valid (a long sentence takes a while to speak)
     constexpr std::string_view OWN_LINE_TEXT = "...";
     constexpr std::int64_t SAY_TEXT_SECONDS = 90;
+
+    // Finding by name: the kinds of lines, what the script learns about a character, how many lines go out
+    // if the script names no number, and how many map markers and doors are looked through at most
+    constexpr std::int32_t FOUND_IS_CHARACTER = 0;
+    constexpr std::int32_t FOUND_IS_DOOR = 1;
+    constexpr std::int32_t FOUND_IS_MAP_MARKER = 2;
+    constexpr std::int32_t FOUND_IS_THING = 3;
+    constexpr std::int32_t FOUND_IS_DEAD = 1;
+    constexpr std::size_t DEFAULT_MAX_FOUND = 8;
+    constexpr std::size_t MAX_PLACES_TO_SEARCH = 1000;
+    // In UTF-8 the capital letters with marks on them (the German umlauts among them) are this byte followed by one
+    // from the range below, and the small letter is that second byte plus the step
+    constexpr unsigned char MARKED_LETTER_BYTE = 0xC3;
+    constexpr unsigned char FIRST_MARKED_CAPITAL = 0x80;
+    constexpr unsigned char LAST_MARKED_CAPITAL = 0x9E;
+    constexpr unsigned char MULTIPLICATION_SIGN_BYTE = 0x97;
+    constexpr unsigned char SMALL_LETTER_STEP = 0x20;
 
     // Surroundings: rays through the physics of the game tell what is around a character.
     // In how many directions (spread evenly, the first one straight ahead) and how many numbers go out per direction
@@ -1000,6 +1017,108 @@ namespace Companion {
         return line;
     }
 
+    // ------------------------------------------------------------------- find
+    // Finding something by its name anywhere in the loaded area: characters, doors (by the place they lead to),
+    // map markers and things. The lists of the state only hold the nearest few of each, so a shop at the other end
+    // of town or a character across the hall is not in them
+
+    // A text in small letters, for comparing without minding capitals. German umlauts are made small as well
+    std::string ToSearchText(std::string_view text) {
+        std::string lowered(text);
+        for (std::size_t index = 0; index < lowered.size(); ++index) {
+            const auto letter = static_cast<unsigned char>(lowered[index]);
+            const bool isAfterMark = index > 0 && static_cast<unsigned char>(lowered[index - 1]) == MARKED_LETTER_BYTE;
+            if (isAfterMark && letter >= FIRST_MARKED_CAPITAL && letter <= LAST_MARKED_CAPITAL && letter != MULTIPLICATION_SIGN_BYTE) {
+                lowered[index] = static_cast<char>(letter + SMALL_LETTER_STEP);
+            } else if (letter < 0x80) {
+                lowered[index] = static_cast<char>(std::tolower(letter));
+            }
+        }
+        return lowered;
+    }
+
+    // The words of a text in small letters
+    std::vector<std::string> GetSearchWords(std::string_view text) {
+        std::vector<std::string> words;
+        const std::string lowered = ToSearchText(text);
+        std::size_t start = 0;
+        while (start < lowered.size()) {
+            const auto end = lowered.find_first_of(" \t\r\n", start);
+            if (end != start) words.push_back(lowered.substr(start, end == std::string::npos ? std::string::npos : end - start));
+            if (end == std::string::npos) break;
+            start = end + 1;
+        }
+        return words;
+    }
+
+    // Whether a name holds every one of the words, anywhere in it
+    bool HoldsAllWords(std::string_view name, const std::vector<std::string>& words) {
+        const std::string lowered = ToSearchText(name);
+        return std::all_of(words.begin(), words.end(), [&](const std::string& word) { return lowered.find(word) != std::string::npos; });
+    }
+
+    // Everything in the loaded area around the viewer whose name holds all the words, nearest first, at most limit.
+    // Of doors, map markers and things with the same name only the nearest one is kept
+    std::vector<Thing> FindAround(RE::PlayerCharacter* player, RE::Actor* viewer, const std::vector<std::string>& words, std::size_t limit) {
+        std::vector<Thing> found;
+        const auto own = viewer->GetPosition();
+        const float radius = static_cast<float>(DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER;
+        const auto keep = [&](std::int32_t kind, RE::FormID referenceID, const RE::NiPoint3& position, std::int32_t flags, std::string name) {
+            Thing match;
+            match.kind = kind;
+            match.referenceID = referenceID;
+            match.distance = own.GetDistance(position);
+            match.view = GetViewFrom(viewer, position);
+            match.flags = flags;
+            match.name = std::move(name);
+            found.push_back(std::move(match));
+        };
+
+        ForEachReferenceAround(viewer, radius, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference == viewer || reference == player || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            const auto* base = reference->GetBaseObject();
+            if (!base) return RE::BSContainer::ForEachResult::kContinue;
+            const auto* actor = reference->As<RE::Actor>();
+            std::int32_t kind = FOUND_IS_THING;
+            std::string name;
+            if (actor) {
+                kind = FOUND_IS_CHARACTER;
+                name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            } else if (base->Is(RE::FormType::Door)) {
+                kind = FOUND_IS_DOOR;
+                name = GetNameBehindDoor(reference);
+            } else if (GetThingKind(base) >= 0) {
+                name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            }
+            if (name.empty() || !HoldsAllWords(name, words)) return RE::BSContainer::ForEachResult::kContinue;
+            keep(kind, reference->GetFormID(), reference->GetPosition(), actor && actor->IsDead() ? FOUND_IS_DEAD : 0, std::move(name));
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        for (auto& marker : CollectMapMarkers(player, viewer, radius, MAX_PLACES_TO_SEARCH)) {
+            if (!HoldsAllWords(marker.name, words)) continue;
+            Thing match;
+            match.kind = FOUND_IS_MAP_MARKER;
+            match.referenceID = marker.referenceID;
+            match.distance = marker.distance;
+            match.view = marker.view;
+            match.name = std::move(marker.name);
+            found.push_back(std::move(match));
+        }
+
+        std::sort(found.begin(), found.end(), [](const Thing& left, const Thing& right) { return left.distance < right.distance; });
+        std::vector<Thing> kept;
+        for (auto& match : found) {
+            if (kept.size() >= limit) break;
+            const bool isKnown = match.kind != FOUND_IS_CHARACTER && std::any_of(kept.begin(), kept.end(), [&](const Thing& other) {
+                return other.kind == match.kind && other.name == match.name;
+            });
+            if (!isKnown) kept.push_back(std::move(match));
+        }
+        return kept;
+    }
+
     // ------------------------------------------------------------ surroundings
     // What is around a character, found by rays through the physics of the game: how far it is to the next wall
     // in each direction, whether the ground only rises there, and where the ground drops away.
@@ -1597,6 +1716,22 @@ namespace Companion {
         return lines;
     }
 
+    // What in the loaded area around the viewer (origin, or the player - see GetViewer) has a name that holds every word
+    // of the text, nearest first, at most maxResults. Capitals do not matter. One text per match, built like the lines
+    // of GetNearbyThings: kind (0 = a character, 1 = a door, 2 = a map marker, 3 = a thing), ref ID, distance in meters,
+    // angle in degrees (negative = left), for a character 1 if it is dead (0 otherwise), name (for a door: of the place it leads to)
+    std::vector<std::string> FindByName(RE::StaticFunctionTag*, RE::BSFixedString text, std::int32_t maxResults, RE::Actor* origin) {
+        std::vector<std::string> lines;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        const auto words = GetSearchWords(ViewOf(text.c_str()));
+        if (!player || words.empty()) return lines;
+        auto* viewer = GetViewer(origin, player);
+        const std::size_t limit = maxResults > 0 ? static_cast<std::size_t>(maxResults) : DEFAULT_MAX_FOUND;
+        for (const auto& match : FindAround(player, viewer, words, limit)) lines.push_back(GetThingLine(match));
+        logger::debug("FindByName: {} matches sent", lines.size());
+        return lines;
+    }
+
     // The reference with this ID (given in its upper and lower 16 bits, as the companion server sends IDs), or nullptr
     RE::TESObjectREFR* FindReference(std::int32_t highHalf, std::int32_t lowHalf) {
         const RE::FormID wantedID = (static_cast<RE::FormID>(highHalf & 0xFFFF) << 16) | static_cast<RE::FormID>(lowHalf & 0xFFFF);
@@ -1712,6 +1847,7 @@ namespace Companion {
         vm->RegisterFunction("TakeRestingArrow", SCRIPT_NAME, TakeRestingArrow);
         vm->RegisterFunction("SetSayText", SCRIPT_NAME, SetSayText);
         vm->RegisterFunction("GetSurroundings", SCRIPT_NAME, GetSurroundings);
+        vm->RegisterFunction("FindByName", SCRIPT_NAME, FindByName);
         return true;
     }
 
