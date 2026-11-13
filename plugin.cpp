@@ -34,7 +34,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 7;
+    constexpr std::int32_t INTERFACE_VERSION = 8;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -128,6 +128,13 @@ namespace Companion {
     constexpr std::int32_t FURNITURE_IS_SEAT = 1;
     constexpr std::int32_t CONTAINER_IS_LOCKED = 1;
     constexpr std::int32_t DEFAULT_THING_RADIUS_METERS = 10;
+    // Tables are no furniture for the game: they are scenery without a name. They are told by the file name of their
+    // model, which holds this word (eg nobletablelong01.nif, commontablesquare01.nif) ...
+    constexpr std::string_view TABLE_MODEL_WORD = "table";
+    // ... and none of these: other words with "table" in them, and what only lies or stands on a table
+    constexpr std::array<std::string_view, 6> NOT_A_TABLE_MODEL_WORDS = {"stable", "vegetable", "portable", "cloth", "bench", "candle"};
+    // The name such a table goes out with
+    constexpr std::string_view TABLE_NAME = "Table";
     constexpr std::size_t DEFAULT_MAX_THINGS_PER_KIND = 4;
 
     // Functions of the game this plugin calls through the Address Library, by their IDs for Skyrim SE (which Skyrim VR shares).
@@ -792,9 +799,27 @@ namespace Companion {
         }
     }
 
+    // Whether this is the scenery the game builds its tables from (see TABLE_MODEL_WORD)
+    bool IsTable(const RE::TESBoundObject* base) {
+        const RE::TESObjectSTAT* scenery = base->As<RE::TESObjectSTAT>();
+        if (!scenery) scenery = base->As<RE::BGSMovableStatic>();
+        if (!scenery) return false;
+        std::string_view fileName = ViewOf(scenery->GetModel());
+        const auto lastSeparator = fileName.find_last_of("\\/");
+        if (lastSeparator != std::string_view::npos) fileName.remove_prefix(lastSeparator + 1);
+        std::string lowered(fileName);
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char letter) { return static_cast<char>(std::tolower(letter)); });
+        if (lowered.find(TABLE_MODEL_WORD) == std::string::npos) return false;
+        for (const auto word : NOT_A_TABLE_MODEL_WORDS) {
+            if (lowered.find(word) != std::string::npos) return false;
+        }
+        return true;
+    }
+
     // The things within the radius around the viewer: of every kind the nearest ones, at most limitPerKind,
     // furniture first, then containers, then items. Things without a name are left out (the game has many
-    // invisible pieces of furniture that only tell characters where to lean or stand)
+    // invisible pieces of furniture that only tell characters where to lean or stand), except for tables,
+    // which go out as furniture under the name TABLE_NAME
     std::vector<Thing> CollectThings(RE::Actor* viewer, float radius, std::size_t limitPerKind) {
         std::array<std::vector<Thing>, THING_KIND_COUNT> thingsByKind;
         const auto own = viewer->GetPosition();
@@ -804,9 +829,12 @@ namespace Companion {
                 return RE::BSContainer::ForEachResult::kContinue;
             }
             const auto* base = reference->GetBaseObject();
-            const std::int32_t kind = base ? GetThingKind(base) : -1;
+            if (!base) return RE::BSContainer::ForEachResult::kContinue;
+            const bool isTable = IsTable(base);
+            const std::int32_t kind = isTable ? THING_IS_FURNITURE : GetThingKind(base);
             if (kind < 0) return RE::BSContainer::ForEachResult::kContinue;
             std::string name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            if (name.empty() && isTable) name = TABLE_NAME;
             if (name.empty()) return RE::BSContainer::ForEachResult::kContinue;
 
             Thing thing;
