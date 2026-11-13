@@ -34,7 +34,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 10;
+    constexpr std::int32_t INTERFACE_VERSION = 11;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -207,6 +207,8 @@ namespace Companion {
     constexpr std::uint64_t PHYSICS_LOCK_ID = 66976;
     constexpr std::uint64_t PHYSICS_UNLOCK_ID = 66982;
     constexpr std::uint64_t DISABLE_REFERENCE_ID = 19373;
+    // RE::Actor::IsHostileToActor, for the order of GetCharactersAround
+    constexpr std::uint64_t HOSTILE_TO_ACTOR_ID = 36537;
     // The file name is these two parts around the version of the game, eg "1-4-15-0"
     constexpr std::string_view ADDRESS_FILE_START = "Data/SKSE/Plugins/version-";
     constexpr std::string_view ADDRESS_FILE_END = ".csv";
@@ -1716,6 +1718,64 @@ namespace Companion {
         return lines;
     }
 
+    // The characters in the loaded area around the viewer (origin, or the player - see GetViewer) within radiusMeters,
+    // at most maxCharacters: first the living that are hostile to the player, then the other living, then the dead,
+    // each nearest first. The player and the viewer are left out. People and animals alike.
+    // For the list "Nearby" outdoors: the script itself only reaches the characters of the one cell the viewer stands in,
+    // so archers on a tower or game a hundred meters away were missing. Empty if the viewer is not in the loaded area
+    std::vector<RE::Actor*> GetCharactersAround(RE::StaticFunctionTag*, RE::Actor* origin, std::int32_t radiusMeters, std::int32_t maxCharacters) {
+        std::vector<RE::Actor*> characters;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || radiusMeters <= 0 || maxCharacters <= 0) return characters;
+        auto* viewer = GetViewer(origin, player);
+        if (!viewer->Is3DLoaded()) return characters;
+
+        struct SeenCharacter {
+            RE::Actor* actor = nullptr;
+            float distance = 0.0f;
+            std::int32_t rank = 0;
+        };
+        constexpr std::int32_t RANK_HOSTILE = 0;
+        constexpr std::int32_t RANK_LIVING = 1;
+        constexpr std::int32_t RANK_DEAD = 2;
+        // Without the function of the game that tells hostility, the living simply come nearest first
+        const bool canTellHostile = HasGameAddress(HOSTILE_TO_ACTOR_ID);
+        std::vector<SeenCharacter> seen;
+        const auto own = viewer->GetPosition();
+        const float radius = static_cast<float>(radiusMeters) * GAME_UNITS_PER_METER;
+        ForEachReferenceAround(viewer, radius, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference == viewer || reference == player || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            auto* actor = reference->As<RE::Actor>();
+            // A character without a body is not in the world right now (eg it waits to be placed)
+            if (!actor || !actor->Is3DLoaded()) return RE::BSContainer::ForEachResult::kContinue;
+            SeenCharacter character;
+            character.actor = actor;
+            character.distance = own.GetDistance(actor->GetPosition());
+            if (actor->IsDead()) {
+                character.rank = RANK_DEAD;
+            } else if (canTellHostile && actor->IsHostileToActor(player)) {
+                character.rank = RANK_HOSTILE;
+            } else {
+                character.rank = RANK_LIVING;
+            }
+            seen.push_back(character);
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        std::sort(seen.begin(), seen.end(), [](const SeenCharacter& left, const SeenCharacter& right) {
+            if (left.rank != right.rank) return left.rank < right.rank;
+            return left.distance < right.distance;
+        });
+        const std::size_t limit = static_cast<std::size_t>(maxCharacters);
+        for (const auto& character : seen) {
+            if (characters.size() >= limit) break;
+            characters.push_back(character.actor);
+        }
+        logger::debug("GetCharactersAround: {} of {} characters within {} meters sent", characters.size(), seen.size(), radiusMeters);
+        return characters;
+    }
+
     // What in the loaded area around the viewer (origin, or the player - see GetViewer) has a name that holds every word
     // of the text, nearest first, at most maxResults. Capitals do not matter. One text per match, built like the lines
     // of GetNearbyThings: kind (0 = a character, 1 = a door, 2 = a map marker, 3 = a thing), ref ID, distance in meters,
@@ -1848,6 +1908,7 @@ namespace Companion {
         vm->RegisterFunction("SetSayText", SCRIPT_NAME, SetSayText);
         vm->RegisterFunction("GetSurroundings", SCRIPT_NAME, GetSurroundings);
         vm->RegisterFunction("FindByName", SCRIPT_NAME, FindByName);
+        vm->RegisterFunction("GetCharactersAround", SCRIPT_NAME, GetCharactersAround);
         return true;
     }
 
@@ -1873,6 +1934,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     }
     if (!Companion::HasGameAddress(Companion::DISABLE_REFERENCE_ID)) {
         logger::warn("The Address Library has no ID {}: arrows that were shot cannot be picked up.", Companion::DISABLE_REFERENCE_ID);
+    }
+    if (!Companion::HasGameAddress(Companion::HOSTILE_TO_ACTOR_ID)) {
+        logger::warn("The Address Library has no ID {}: the characters around come nearest first, not hostile ones first.", Companion::HOSTILE_TO_ACTOR_ID);
     }
     if (const auto* messaging = SKSE::GetMessagingInterface()) {
         messaging->RegisterListener("SKSE", Companion::OnMessage);
