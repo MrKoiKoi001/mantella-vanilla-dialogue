@@ -1,8 +1,8 @@
 // Plugin of the AI companion mod for Skyrim (KI_MCP_Gefaehrte.esp).
 // It reads what Papyrus scripts cannot get at and hands it to the script KI_MCP_Gefaehrte_Native.
 // So far: the open quests of the player with the texts of their objectives and where their targets are,
-// the places around the player (map markers and doors that lead somewhere),
-// the things close to the player (furniture, containers and items that lie around),
+// the places around the player or the companion (map markers and doors that lead somewhere),
+// the things close to them (furniture, containers and items that lie around),
 // and what the characters around the player say (the subtitles of the game).
 //
 // The project layout and the places of the subtitle hook come from mikastamm/mantella-vanilla-dialogue (MIT license),
@@ -33,7 +33,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 4;
+    constexpr std::int32_t INTERFACE_VERSION = 5;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -411,8 +411,8 @@ namespace Companion {
     }
 
     // -------------------------------------------------------------- positions
-    // Where something is, seen from the player: how far away, and at which angle from where the player faces.
-    // The companion server works out the same for the companion (src/companion/game_state.py in the Mantella fork)
+    // Where something is, seen from a viewer: how far away, and at which angle from where the viewer faces.
+    // The viewer is the player, or the companion if the script asks for its surroundings (see GetViewer)
 
     // Whether the Address Library of this game has the function with this ID. Only Skyrim VR can lack one
     bool HasGameAddress(std::uint64_t wantedID) {
@@ -441,18 +441,18 @@ namespace Companion {
 
     struct View {
         std::int32_t distanceMeters = 0;
-        // Negative = to the left of where the player faces, positive = to the right
+        // Negative = to the left of where the viewer faces, positive = to the right
         std::int32_t angleDegrees = 0;
     };
 
-    View GetViewFromPlayer(const RE::PlayerCharacter* player, const RE::NiPoint3& point) {
-        const auto own = player->GetPosition();
+    View GetViewFrom(const RE::TESObjectREFR* viewer, const RE::NiPoint3& point) {
+        const auto own = viewer->GetPosition();
         const float east = point.x - own.x;
         const float north = point.y - own.y;
         const float up = point.z - own.z;
         // The game counts directions clockwise from north, like a compass
         const float direction = std::atan2(east, north) * DEGREES_PER_RADIAN;
-        const float facing = player->GetAngleZ() * DEGREES_PER_RADIAN;
+        const float facing = viewer->GetAngleZ() * DEGREES_PER_RADIAN;
         View view;
         view.distanceMeters = static_cast<std::int32_t>(std::lround(std::sqrt(east * east + north * north + up * up) / GAME_UNITS_PER_METER));
         view.angleDegrees = static_cast<std::int32_t>(std::lround(std::remainder(direction - facing, FULL_CIRCLE_DEGREES)));
@@ -532,34 +532,36 @@ namespace Companion {
 
     struct QuestTarget {
         std::int32_t kind = TARGET_IS_ELSEWHERE;
+        // What the companion can walk to: the target itself, or the door on the way to it (0 = neither is at hand)
+        RE::FormID referenceID = 0;
         View view;
         std::string name;
         std::string place;
     };
 
-    // The first door on the way to the target that is in the area of the player, or nullptr
-    const RE::TESObjectREFR* FindDoorOnTheWay(const RE::TESQuestTarget* target, const RE::TESObjectCELL* playerCell) {
+    // The first door on the way to the target that is in the area of the viewer, or nullptr
+    const RE::TESObjectREFR* FindDoorOnTheWay(const RE::TESQuestTarget* target, const RE::TESObjectCELL* viewerCell) {
         const auto& doors = target->teleportPath.teleportRefs;
         if (doors.empty() || doors.size() > MAX_DOORS_ON_THE_WAY || doors.size() > doors.capacity()) return nullptr;
         if (!IsReadableMemory(doors.data(), doors.size() * sizeof(RE::TeleportPath::TeleportLink))) return nullptr;
         for (const auto& door : doors) {
             if (!IsKnownForm(door.ref)) continue;
-            if (IsSameSpace(playerCell, GetCellOf(door.ref))) return door.ref;
+            if (IsSameSpace(viewerCell, GetCellOf(door.ref))) return door.ref;
         }
         return nullptr;
     }
 
-    // A door in the loaded area around the player that leads straight into this cell, the nearest one, or nullptr.
+    // A door in the loaded area around the viewer that leads straight into this cell, the nearest one, or nullptr.
     // For targets inside a building of the town the player stands in, if the game has no way to the target at hand
-    const RE::TESObjectREFR* FindLoadedDoorInto(const RE::TESObjectCELL* targetCell, RE::PlayerCharacter* player) {
+    const RE::TESObjectREFR* FindLoadedDoorInto(const RE::TESObjectCELL* targetCell, RE::Actor* viewer) {
         if (!targetCell || !targetCell->IsInteriorCell() || !HasGameAddress(WORLD_SINGLETON_ID)) return nullptr;
         auto* world = RE::TES::GetSingleton();
         if (!world) return nullptr;
-        const auto own = player->GetPosition();
+        const auto own = viewer->GetPosition();
         const RE::TESObjectREFR* nearestDoor = nullptr;
         float nearestDistance = 0.0f;
 
-        world->ForEachReferenceInRange(player, static_cast<float>(DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER, [&](RE::TESObjectREFR* reference) {
+        world->ForEachReferenceInRange(viewer, static_cast<float>(DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER, [&](RE::TESObjectREFR* reference) {
             if (!reference || reference->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
             const auto* base = reference->GetBaseObject();
             if (!base || !base->Is(RE::FormType::Door)) return RE::BSContainer::ForEachResult::kContinue;
@@ -580,10 +582,10 @@ namespace Companion {
 
     // The targets of one objective that count at the moment, at most MAX_TARGETS_PER_OBJECTIVE
     std::vector<QuestTarget> CollectTargets(const RE::TESQuest* quest, const RE::BGSQuestObjective* objective, RE::PlayerCharacter* player,
-                                            bool canCheckConditions) {
+                                            RE::Actor* viewer, bool canCheckConditions) {
         std::vector<QuestTarget> targets;
         if (!objective->targets) return targets;
-        const auto* playerCell = GetCellOf(player);
+        const auto* viewerCell = GetCellOf(viewer);
         const std::size_t count = std::min<std::size_t>(objective->numTargets, MAX_CHECKED_TARGETS);
         std::vector<const RE::TESObjectREFR*> seen;
 
@@ -600,16 +602,18 @@ namespace Companion {
             QuestTarget found;
             found.name = CleanText(ViewOf(reference->GetDisplayFullName()));
             const auto* targetCell = GetCellOf(reference.get());
-            if (IsSameSpace(playerCell, targetCell)) {
+            if (IsSameSpace(viewerCell, targetCell)) {
                 found.kind = TARGET_IS_HERE;
-                found.view = GetViewFromPlayer(player, reference->GetPosition());
+                found.referenceID = reference->GetFormID();
+                found.view = GetViewFrom(viewer, reference->GetPosition());
             } else {
                 // First the way the game itself has worked out, then a door that leads straight to where the target is
-                const auto* door = FindDoorOnTheWay(target, playerCell);
-                if (!door) door = FindLoadedDoorInto(targetCell, player);
+                const auto* door = FindDoorOnTheWay(target, viewerCell);
+                if (!door) door = FindLoadedDoorInto(targetCell, viewer);
                 if (door) {
                     found.kind = TARGET_IS_BEHIND_DOOR;
-                    found.view = GetViewFromPlayer(player, door->GetPosition());
+                    found.referenceID = door->GetFormID();
+                    found.view = GetViewFrom(viewer, door->GetPosition());
                     found.place = GetNameBehindDoor(door);
                 } else {
                     found.kind = TARGET_IS_ELSEWHERE;
@@ -627,6 +631,8 @@ namespace Companion {
 
     struct Place {
         std::int32_t kind = PLACE_IS_MAP_MARKER;
+        // The map marker or the door itself, so that the companion can walk to it
+        RE::FormID referenceID = 0;
         float distance = 0.0f;
         View view;
         // For a map marker: the kind of place as the game numbers it (RE::MARKER_TYPE), and MARKER_IS_KNOWN or 0
@@ -657,13 +663,13 @@ namespace Companion {
         return &player->GetPlayerRuntimeData().currentMapMarkers;
     }
 
-    std::vector<Place> CollectMapMarkers(RE::PlayerCharacter* player, float radius, std::size_t limit) {
+    std::vector<Place> CollectMapMarkers(RE::PlayerCharacter* player, RE::Actor* viewer, float radius, std::size_t limit) {
         std::vector<Place> places;
-        const auto* playerCell = GetCellOf(player);
+        const auto* viewerCell = GetCellOf(viewer);
         const auto* markers = GetMapMarkers(player);
         // Indoors the map of the world outside says nothing about what is near
-        if (!markers || !playerCell || playerCell->IsInteriorCell()) return places;
-        const auto own = player->GetPosition();
+        if (!markers || !viewerCell || viewerCell->IsInteriorCell()) return places;
+        const auto own = viewer->GetPosition();
 
         for (const auto& handle : *markers) {
             const auto marker = handle.get();
@@ -672,14 +678,15 @@ namespace Companion {
             if (distance > radius) continue;
             const auto* extra = marker->extraList.GetByType<RE::ExtraMapMarker>();
             const auto* data = extra ? extra->mapData : nullptr;
-            if (!data || !IsSameSpace(playerCell, GetCellOf(marker.get()))) continue;
+            if (!data || !IsSameSpace(viewerCell, GetCellOf(marker.get()))) continue;
 
             Place place;
             place.kind = PLACE_IS_MAP_MARKER;
+            place.referenceID = marker->GetFormID();
             place.name = CleanText(ViewOf(data->locationName.GetFullName()));
             if (place.name.empty()) continue;
             place.distance = distance;
-            place.view = GetViewFromPlayer(player, marker->GetPosition());
+            place.view = GetViewFrom(viewer, marker->GetPosition());
             place.type = static_cast<std::int32_t>(data->type.underlying());
             place.flags = data->flags.any(RE::MapMarkerData::Flag::kCanTravelTo) ? MARKER_IS_KNOWN : 0;
             places.push_back(std::move(place));
@@ -688,15 +695,15 @@ namespace Companion {
         return places;
     }
 
-    // The doors in the loaded area around the player that lead into another area (a building, a cave, out of town)
-    std::vector<Place> CollectDoors(RE::PlayerCharacter* player, float radius, std::size_t limit) {
+    // The doors in the loaded area around the viewer that lead into another area (a building, a cave, out of town)
+    std::vector<Place> CollectDoors(RE::Actor* viewer, float radius, std::size_t limit) {
         std::vector<Place> places;
         if (!HasGameAddress(WORLD_SINGLETON_ID)) return places;
         auto* world = RE::TES::GetSingleton();
         if (!world) return places;
-        const auto own = player->GetPosition();
+        const auto own = viewer->GetPosition();
 
-        world->ForEachReferenceInRange(player, radius, [&](RE::TESObjectREFR* reference) {
+        world->ForEachReferenceInRange(viewer, radius, [&](RE::TESObjectREFR* reference) {
             if (!reference || reference->IsDisabled()) return RE::BSContainer::ForEachResult::kContinue;
             const auto* base = reference->GetBaseObject();
             if (!base || !base->Is(RE::FormType::Door)) return RE::BSContainer::ForEachResult::kContinue;
@@ -705,9 +712,10 @@ namespace Companion {
 
             Place place;
             place.kind = PLACE_IS_DOOR;
+            place.referenceID = reference->GetFormID();
             place.name = std::move(name);
             place.distance = own.GetDistance(reference->GetPosition());
-            place.view = GetViewFromPlayer(player, reference->GetPosition());
+            place.view = GetViewFrom(viewer, reference->GetPosition());
             places.push_back(std::move(place));
             return RE::BSContainer::ForEachResult::kContinue;
         });
@@ -716,7 +724,7 @@ namespace Companion {
     }
 
     // ----------------------------------------------------------------- things
-    // What stands and lies around the player: furniture (chairs, benches, beds, workbenches), containers (chests, barrels,
+    // What stands and lies around the viewer: furniture (chairs, benches, beds, workbenches), containers (chests, barrels,
     // sacks) and items that can be picked up. The companion can sit down on a seat and empty a container,
     // so each thing goes out with its ref ID
 
@@ -752,18 +760,18 @@ namespace Companion {
         }
     }
 
-    // The things within the radius around the player: of every kind the nearest ones, at most limitPerKind,
+    // The things within the radius around the viewer: of every kind the nearest ones, at most limitPerKind,
     // furniture first, then containers, then items. Things without a name are left out (the game has many
     // invisible pieces of furniture that only tell characters where to lean or stand)
-    std::vector<Thing> CollectThings(RE::PlayerCharacter* player, float radius, std::size_t limitPerKind) {
+    std::vector<Thing> CollectThings(RE::Actor* viewer, float radius, std::size_t limitPerKind) {
         std::array<std::vector<Thing>, THING_KIND_COUNT> thingsByKind;
         if (!HasGameAddress(WORLD_SINGLETON_ID)) return {};
         auto* world = RE::TES::GetSingleton();
         if (!world) return {};
-        const auto own = player->GetPosition();
+        const auto own = viewer->GetPosition();
 
-        world->ForEachReferenceInRange(player, radius, [&](RE::TESObjectREFR* reference) {
-            if (!reference || reference == player || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+        world->ForEachReferenceInRange(viewer, radius, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference == viewer || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
                 return RE::BSContainer::ForEachResult::kContinue;
             }
             const auto* base = reference->GetBaseObject();
@@ -777,7 +785,7 @@ namespace Companion {
             thing.referenceID = reference->GetFormID();
             thing.name = std::move(name);
             thing.distance = own.GetDistance(reference->GetPosition());
-            thing.view = GetViewFromPlayer(player, reference->GetPosition());
+            thing.view = GetViewFrom(viewer, reference->GetPosition());
             if (kind == THING_IS_FURNITURE) {
                 const auto* furniture = base->As<RE::TESFurniture>();
                 if (furniture && furniture->furnFlags.any(RE::TESFurniture::ActiveMarker::kCanSit)) thing.flags = FURNITURE_IS_SEAT;
@@ -1032,20 +1040,30 @@ namespace Companion {
         return lines;
     }
 
+    // From whom the lists for the script are seen: the character the script names, or the player if it names none
+    // or one that has no body in the loaded area
+    RE::Actor* GetViewer(RE::Actor* origin, RE::PlayerCharacter* player) {
+        if (origin && origin->Is3DLoaded() && !origin->IsDisabled()) return origin;
+        return player;
+    }
+
     // Whether the plugin can ask the game about the conditions of quest targets. Without that, GetQuestTargets
     // hands out every target of an objective, also those the game itself would not show at the moment
     bool canCheckTargetConditions = false;
 
     // Where the targets of the tracked quests are, at most maxTargets. One text per target, its parts separated by tabs:
     // place of the quest in the list GetOpenQuests(maxQuests) returns (from 0), place of the objective in that quest (from 0),
-    // where the target is (0 = in the area of the player, 1 = behind a door of this area, 2 = somewhere else),
-    // distance to the player in meters and angle from where the player faces in degrees (negative = left) - for 1 these are
+    // where the target is (0 = in the area of the viewer, 1 = behind a door of this area, 2 = somewhere else),
+    // distance to the viewer in meters and angle from where the viewer faces in degrees (negative = left) - for 1 these are
     // the distance and angle of that door, for 2 both are 0 -, name of the target (can be empty),
-    // and for 1 and 2 the name of the place behind the door or of the place the target is in (can be empty)
-    std::vector<std::string> GetQuestTargets(RE::StaticFunctionTag*, std::int32_t maxQuests, std::int32_t maxTargets) {
+    // for 1 and 2 the name of the place behind the door or of the place the target is in (can be empty),
+    // and the ref ID to walk to as eight hex digits: the target for 0, that door for 1, 00000000 for 2.
+    // The viewer is origin if that character stands in the loaded area, otherwise the player (see GetViewer)
+    std::vector<std::string> GetQuestTargets(RE::StaticFunctionTag*, std::int32_t maxQuests, std::int32_t maxTargets, RE::Actor* origin) {
         std::vector<std::string> lines;
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return lines;
+        auto* viewer = GetViewer(origin, player);
         const auto quests = CollectOpenQuests();
         const std::size_t questLimit = maxQuests > 0 ? static_cast<std::size_t>(maxQuests) : DEFAULT_MAX_QUESTS;
         const std::size_t targetLimit = maxTargets > 0 ? static_cast<std::size_t>(maxTargets) : DEFAULT_MAX_QUEST_TARGETS;
@@ -1055,7 +1073,7 @@ namespace Companion {
             // The compass of the game only shows the targets of tracked quests, and so does this list
             if (!entry.quest->IsActive()) continue;
             for (std::size_t objectiveIndex = 0; objectiveIndex < entry.objectiveForms.size(); ++objectiveIndex) {
-                const auto targets = CollectTargets(entry.quest, entry.objectiveForms[objectiveIndex], player, canCheckTargetConditions);
+                const auto targets = CollectTargets(entry.quest, entry.objectiveForms[objectiveIndex], player, viewer, canCheckTargetConditions);
                 for (const auto& target : targets) {
                     if (lines.size() >= targetLimit) return lines;
                     std::string line = std::to_string(questIndex);
@@ -1071,6 +1089,8 @@ namespace Companion {
                     line += target.name;
                     line += FIELD_SEPARATOR;
                     line += target.place;
+                    line += FIELD_SEPARATOR;
+                    line += std::format("{:08X}", target.referenceID);
                     lines.push_back(std::move(line));
                 }
             }
@@ -1079,30 +1099,35 @@ namespace Companion {
         return lines;
     }
 
-    // The places around the player, map markers first, then doors, each nearest first:
+    // The places around the viewer (origin, or the player - see GetViewer), map markers first, then doors, each nearest first:
     // at most maxMarkers map markers within radiusMeters (none indoors), and at most maxDoors doors in the loaded area
     // within radiusMeters that lead into another area. One text per place, its parts separated by tabs:
-    // kind (0 = map marker, 1 = door), distance to the player in meters, angle from where the player faces in degrees
+    // kind (0 = map marker, 1 = door), ref ID of the marker or the door as eight hex digits,
+    // distance to the viewer in meters, angle from where the viewer faces in degrees
     // (negative = left), for a map marker the kind of place as the game numbers it (13 = farm, 21 = stable ...; 0 for a door),
     // for a map marker 1 if the player has been there (0 otherwise, and for a door),
     // name of the place, for a door the name of the place it leads to
-    std::vector<std::string> GetNearbyPlaces(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxMarkers, std::int32_t maxDoors) {
+    std::vector<std::string> GetNearbyPlaces(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxMarkers, std::int32_t maxDoors,
+                                             RE::Actor* origin) {
         std::vector<std::string> lines;
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return lines;
+        auto* viewer = GetViewer(origin, player);
         const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_PLACE_RADIUS_METERS) * GAME_UNITS_PER_METER;
         // A limit of 0 switches that kind of place off, a negative one means: the usual number
         const std::size_t markerLimit = maxMarkers >= 0 ? static_cast<std::size_t>(maxMarkers) : DEFAULT_MAX_MAP_MARKERS;
         const std::size_t doorLimit = maxDoors >= 0 ? static_cast<std::size_t>(maxDoors) : DEFAULT_MAX_DOORS;
 
         std::vector<Place> places;
-        if (markerLimit > 0) places = CollectMapMarkers(player, radius, markerLimit);
+        if (markerLimit > 0) places = CollectMapMarkers(player, viewer, radius, markerLimit);
         if (doorLimit > 0) {
-            auto doors = CollectDoors(player, radius, doorLimit);
+            auto doors = CollectDoors(viewer, radius, doorLimit);
             for (auto& door : doors) places.push_back(std::move(door));
         }
         for (const auto& place : places) {
             std::string line = std::to_string(place.kind);
+            line += FIELD_SEPARATOR;
+            line += std::format("{:08X}", place.referenceID);
             line += FIELD_SEPARATOR;
             line += std::to_string(place.view.distanceMeters);
             line += FIELD_SEPARATOR;
@@ -1119,19 +1144,21 @@ namespace Companion {
         return lines;
     }
 
-    // The things close to the player: furniture first, then containers, then items that lie around, each nearest first,
-    // at most maxPerKind of each kind within radiusMeters. One text per thing, its parts separated by tabs:
-    // kind (0 = furniture, 1 = container, 2 = item), ref ID as eight hex digits, distance to the player in meters,
-    // angle from where the player faces in degrees (negative = left),
+    // The things close to the viewer (origin, or the player - see GetViewer): furniture first, then containers,
+    // then items that lie around, each nearest first, at most maxPerKind of each kind within radiusMeters.
+    // One text per thing, its parts separated by tabs:
+    // kind (0 = furniture, 1 = container, 2 = item), ref ID as eight hex digits, distance to the viewer in meters,
+    // angle from where the viewer faces in degrees (negative = left),
     // for furniture 1 if a character can sit on it, for a container 1 if it is locked (0 otherwise), name
-    std::vector<std::string> GetNearbyThings(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxPerKind) {
+    std::vector<std::string> GetNearbyThings(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxPerKind, RE::Actor* origin) {
         std::vector<std::string> lines;
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return lines;
+        auto* viewer = GetViewer(origin, player);
         const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_THING_RADIUS_METERS) * GAME_UNITS_PER_METER;
         const std::size_t limit = maxPerKind > 0 ? static_cast<std::size_t>(maxPerKind) : DEFAULT_MAX_THINGS_PER_KIND;
 
-        for (const auto& thing : CollectThings(player, radius, limit)) {
+        for (const auto& thing : CollectThings(viewer, radius, limit)) {
             std::string line = std::to_string(thing.kind);
             line += FIELD_SEPARATOR;
             line += std::format("{:08X}", thing.referenceID);
