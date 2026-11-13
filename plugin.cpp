@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -34,7 +35,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 11;
+    constexpr std::int32_t INTERFACE_VERSION = 12;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -1312,8 +1313,56 @@ namespace Companion {
         }
     }
 
+    // Mute: the character whose own lines of the game are not to be heard (0 = nobody), told by the script
+    // (see SetMutedSpeaker), and how many lines of that character have come by. That number tells a line that was
+    // cut short apart from the one that followed it
+    std::atomic<RE::FormID> mutedSpeakerID{ 0 };
+    std::atomic<std::uint32_t> mutedSpeakerLineCount{ 0 };
+
+    // Whether this line is one the game lets the muted character say on its own: a sentence with words
+    // (grunts and cries carry no subtitle), not the own line of the game mod (say), and not an answer in a
+    // conversation the player is having in the dialogue menu
+    bool IsLineToMute(RE::TESObjectREFR* speaker, const char* subtitle) noexcept {
+        try {
+            const RE::FormID wantedID = mutedSpeakerID.load();
+            if (wantedID == 0 || !speaker || !subtitle || speaker->GetFormID() != wantedID) return false;
+            const auto text = ViewOf(subtitle);
+            const auto first = text.find_first_not_of(" \t\r\n");
+            if (first == std::string_view::npos) return false;
+            const auto last = text.find_last_not_of(" \t\r\n");
+            if (text.substr(first, last - first + 1) == OWN_LINE_TEXT) return false;
+            auto* menus = RE::UI::GetSingleton();
+            if (menus && menus->IsMenuOpen(RE::DialogueMenu::MENU_NAME)) return false;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    // Ends the line the muted character has just begun. Not from inside the function of the game that is starting
+    // the line, but with the next frame, so that the game has finished setting the line up. If the character has
+    // begun another line by then (its own line of the game mod, for one), nothing is ended
+    void EndLineSoon(RE::TESObjectREFR* speaker, std::uint32_t lineNumber) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!tasks) return;
+        const auto handle = speaker->GetHandle();
+        tasks->AddTask([handle, lineNumber]() {
+            if (mutedSpeakerLineCount.load() != lineNumber) return;
+            const auto reference = handle.get();
+            if (reference) reference->StopCurrentDialogue();
+        });
+    }
+
     struct SubtitleHook {
         static void Thunk(RE::SubtitleManager* manager, RE::TESObjectREFR* speaker, const char* subtitle, bool alwaysDisplay) {
+            if (speaker && speaker->GetFormID() == mutedSpeakerID.load()) {
+                const std::uint32_t lineNumber = ++mutedSpeakerLineCount;
+                if (IsLineToMute(speaker, subtitle)) {
+                    // No subtitle, no sound, and nothing for the script to hear
+                    EndLineSoon(speaker, lineNumber);
+                    return;
+                }
+            }
             std::string shown;
             original(manager, speaker, PickShownSubtitle(speaker, subtitle, shown), alwaysDisplay);
             // What goes to the script stays the line as the game had it, so that the companion does not hear itself
@@ -1829,6 +1878,18 @@ namespace Companion {
         return CleanText(ViewOf(ammo->GetName()));
     }
 
+    // Mute: from now on the sentences the game lets this character say on its own are cut off as they begin, and their
+    // subtitles are not shown (None = nobody is muted any more). Grunts and cries without a subtitle stay, so do the
+    // own lines of the game mod (say) and what the character answers in the dialogue menu. Returns whether the plugin
+    // can do that at all (it has to listen to the subtitles for it, see IsHearing)
+    bool SetMutedSpeaker(RE::StaticFunctionTag*, RE::Actor* speaker) {
+        const RE::FormID wantedID = speaker ? speaker->GetFormID() : 0;
+        if (mutedSpeakerID.exchange(wantedID) != wantedID) {
+            logger::info("Muted speaker: {:08X}", wantedID);
+        }
+        return isHearing;
+    }
+
     // say: tells what the speaker really says with its next line, so that the subtitle of the own line of the game mod
     // shows that instead of "...". An empty text ends it. Returns whether subtitles can be changed at all
     bool SetSayText(RE::StaticFunctionTag*, RE::Actor* speaker, RE::BSFixedString text) {
@@ -1909,6 +1970,7 @@ namespace Companion {
         vm->RegisterFunction("GetSurroundings", SCRIPT_NAME, GetSurroundings);
         vm->RegisterFunction("FindByName", SCRIPT_NAME, FindByName);
         vm->RegisterFunction("GetCharactersAround", SCRIPT_NAME, GetCharactersAround);
+        vm->RegisterFunction("SetMutedSpeaker", SCRIPT_NAME, SetMutedSpeaker);
         return true;
     }
 
