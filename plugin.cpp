@@ -35,7 +35,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 13;
+    constexpr std::int32_t INTERFACE_VERSION = 14;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -2041,6 +2041,15 @@ namespace Companion {
         return above.isHit ? high.z - above.distance : NO_GROUND_HEIGHT;
     }
 
+    // The horse (or other mount) a character sits on, or nothing if it rides nothing.
+    // Scripts can only ask whether a character rides, not what
+    RE::Actor* GetMount(RE::StaticFunctionTag*, RE::Actor* rider) {
+        if (!rider) return nullptr;
+        RE::NiPointer<RE::Actor> mount;
+        if (!rider->GetMount(mount)) return nullptr;
+        return mount.get();
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -2063,6 +2072,7 @@ namespace Companion {
         vm->RegisterFunction("SetMutedSpeaker", SCRIPT_NAME, SetMutedSpeaker);
         vm->RegisterFunction("GetSurroundingsToward", SCRIPT_NAME, GetSurroundingsToward);
         vm->RegisterFunction("GetGroundHeight", SCRIPT_NAME, GetGroundHeight);
+        vm->RegisterFunction("GetMount", SCRIPT_NAME, GetMount);
         return true;
     }
 
