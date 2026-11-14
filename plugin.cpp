@@ -35,7 +35,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 12;
+    constexpr std::int32_t INTERFACE_VERSION = 13;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -181,6 +181,20 @@ namespace Companion {
     constexpr std::int32_t NO_DROP = -1;
     constexpr std::int32_t DEFAULT_SURROUNDINGS_METERS = 15;
     constexpr std::int32_t MAX_SURROUNDINGS_METERS = 30;
+    // A look in one direction (GetSurroundingsToward) may reach further. The game only has the physics of the area
+    // it has loaded around the player (outdoors about 120 meters), so a ray finds nothing beyond that
+    constexpr std::int32_t MAX_LOOK_METERS = 200;
+    // The rays of such a look fan out over the angle that is asked for: always an odd number, so that one of them goes
+    // straight into the direction, about this many degrees apart and at most MAX_LOOK_RAYS
+    constexpr float LOOK_RAY_STEP_DEGREES = 15.0f;
+    constexpr std::int32_t MIN_LOOK_RAYS = 3;
+    constexpr std::int32_t MAX_LOOK_RAYS = 9;
+    // The ground at a spot (GetGroundHeight): a ray goes down from this far above the feet of the character to this far
+    // below them. Outdoors, if that finds nothing because the ground rises, a second ray comes down from much higher up
+    constexpr float GROUND_PROBE_UP_UNITS = 150.0f;
+    constexpr float GROUND_PROBE_DOWN_UNITS = 700.0f;
+    constexpr float GROUND_PROBE_HIGH_UNITS = 1000.0f;
+    constexpr float NO_GROUND_HEIGHT = -1000000.0f;
     // The rays start at chest height, outside the body of the character
     constexpr float RAY_HEIGHT_UNITS = 90.0f;
     constexpr float RAY_START_UNITS = 30.0f;
@@ -1900,6 +1914,39 @@ namespace Companion {
         return isHearing;
     }
 
+    // One direction of the surroundings: a ray from the chest of the character into the direction "heading" (radians,
+    // clockwise from north) as far as "range" (game units), and rays down along the free stretch. Adds three numbers to
+    // "values": what the ray met, how far away in meters (0 if nothing), after how many meters the ground drops away
+    // (NO_DROP = it does not). Only call this while the physics are locked for reading
+    void ProbeDirection(RE::bhkWorld* physics, float scale, const RE::NiPoint3& chest, float feetHeight, float heading, float range,
+                        std::vector<std::int32_t>& values) {
+        // The game counts directions clockwise from north, and north is where y grows
+        const RE::NiPoint3 step(std::sin(heading), std::cos(heading), 0.0f);
+        const RayHit ahead = CastRay(physics, scale, chest + step * RAY_START_UNITS, chest + step * range);
+        std::int32_t obstacle = OBSTACLE_NONE;
+        float reach = range;
+        if (ahead.isHit) {
+            obstacle = ahead.normalUp >= WALKABLE_NORMAL_UP ? OBSTACLE_SLOPE : OBSTACLE_WALL;
+            reach = RAY_START_UNITS + ahead.distance;
+        }
+        // Along the free stretch: does the ground fall away somewhere?
+        std::int32_t dropMeters = NO_DROP;
+        float groundBefore = feetHeight;
+        for (float along = DROP_STEP_UNITS; along < reach; along += DROP_STEP_UNITS) {
+            const RE::NiPoint3 top = chest + step * along;
+            const RayHit below = CastRay(physics, scale, top, RE::NiPoint3(top.x, top.y, top.z - DROP_PROBE_UNITS));
+            const float ground = below.isHit ? top.z - below.distance : top.z - DROP_PROBE_UNITS;
+            if (!below.isHit || groundBefore - ground > DROP_HEIGHT_UNITS) {
+                dropMeters = ToWholeMeters(along);
+                break;
+            }
+            groundBefore = ground;
+        }
+        values.push_back(obstacle);
+        values.push_back(obstacle == OBSTACLE_NONE ? 0 : ToWholeMeters(reach));
+        values.push_back(dropMeters);
+    }
+
     // What is around the character within rangeMeters, by rays (see CastRay). SURROUNDING_DIRECTIONS directions,
     // the first straight ahead of the character, the others clockwise from there, three numbers each:
     // what the ray met (0 = nothing, 1 = a wall or another upright obstacle, 2 = ground that rises),
@@ -1923,32 +1970,75 @@ namespace Companion {
         for (std::int32_t index = 0; index < SURROUNDING_DIRECTIONS; ++index) {
             // The game counts directions clockwise from north, and north is where y grows
             const float heading = facing + static_cast<float>(index) * 2.0f * std::numbers::pi_v<float> / static_cast<float>(SURROUNDING_DIRECTIONS);
-            const RE::NiPoint3 step(std::sin(heading), std::cos(heading), 0.0f);
-            const RayHit ahead = CastRay(physics, scale, chest + step * RAY_START_UNITS, chest + step * range);
-            std::int32_t obstacle = OBSTACLE_NONE;
-            float reach = range;
-            if (ahead.isHit) {
-                obstacle = ahead.normalUp >= WALKABLE_NORMAL_UP ? OBSTACLE_SLOPE : OBSTACLE_WALL;
-                reach = RAY_START_UNITS + ahead.distance;
-            }
-            // Along the free stretch: does the ground fall away somewhere?
-            std::int32_t dropMeters = NO_DROP;
-            float groundBefore = feet.z;
-            for (float along = DROP_STEP_UNITS; along < reach; along += DROP_STEP_UNITS) {
-                const RE::NiPoint3 top = chest + step * along;
-                const RayHit below = CastRay(physics, scale, top, RE::NiPoint3(top.x, top.y, top.z - DROP_PROBE_UNITS));
-                const float ground = below.isHit ? top.z - below.distance : top.z - DROP_PROBE_UNITS;
-                if (!below.isHit || groundBefore - ground > DROP_HEIGHT_UNITS) {
-                    dropMeters = ToWholeMeters(along);
-                    break;
-                }
-                groundBefore = ground;
-            }
-            values.push_back(obstacle);
-            values.push_back(obstacle == OBSTACLE_NONE ? 0 : ToWholeMeters(reach));
-            values.push_back(dropMeters);
+            ProbeDirection(physics, scale, chest, feet.z, heading, range, values);
         }
         return values;
+    }
+
+    // Like GetSurroundings, but in a direction the script names and as far as it names: the rays fan out over
+    // angleDegrees around headingDegrees (a point of the compass in degrees, 0 = north, 90 = east), from the left edge
+    // of that angle to the right one, the middle ray straight into the direction. An angle of 0 is one ray, a full
+    // circle (360) is SURROUNDING_DIRECTIONS rays, the first into the direction and the others clockwise from there.
+    // rangeMeters: 0 = the usual range, at most MAX_LOOK_METERS. Three numbers per ray, as GetSurroundings gives them
+    std::vector<std::int32_t> GetSurroundingsToward(RE::StaticFunctionTag*, RE::Actor* origin, std::int32_t rangeMeters,
+                                                    std::int32_t headingDegrees, std::int32_t angleDegrees) {
+        std::vector<std::int32_t> values;
+        if (!origin || !origin->Is3DLoaded()) return values;
+        if (!HasGameAddress(CELL_PHYSICS_ID) || !HasGameAddress(PHYSICS_LOCK_ID) || !HasGameAddress(PHYSICS_UNLOCK_ID)) return values;
+        const auto* cell = origin->GetParentCell();
+        auto* physics = cell ? cell->GetbhkWorld() : nullptr;
+        if (!physics) return values;
+        const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+        const std::int32_t meters = rangeMeters > 0 ? std::min(rangeMeters, MAX_LOOK_METERS) : DEFAULT_SURROUNDINGS_METERS;
+        const float range = static_cast<float>(meters) * GAME_UNITS_PER_METER;
+        const RE::NiPoint3 feet = origin->GetPosition();
+        const RE::NiPoint3 chest(feet.x, feet.y, feet.z + RAY_HEIGHT_UNITS);
+        const float middle = static_cast<float>(headingDegrees) / DEGREES_PER_RADIAN;
+        const float angle = static_cast<float>(std::clamp(angleDegrees, 0, static_cast<std::int32_t>(FULL_CIRCLE_DEGREES)));
+
+        // Where the first ray goes, how far the next one is turned to the right, and how many there are
+        float firstHeading = middle;
+        float turn = 0.0f;
+        std::int32_t rayCount = 1;
+        if (angle >= FULL_CIRCLE_DEGREES) {
+            rayCount = SURROUNDING_DIRECTIONS;
+            turn = 2.0f * std::numbers::pi_v<float> / static_cast<float>(SURROUNDING_DIRECTIONS);
+        } else if (angle > 0.0f) {
+            const auto raysPerSide = static_cast<std::int32_t>(std::ceil(angle / 2.0f / LOOK_RAY_STEP_DEGREES));
+            rayCount = std::clamp(2 * raysPerSide + 1, MIN_LOOK_RAYS, MAX_LOOK_RAYS);
+            turn = angle / DEGREES_PER_RADIAN / static_cast<float>(rayCount - 1);
+            firstHeading = middle - angle / DEGREES_PER_RADIAN / 2.0f;
+        }
+
+        const RE::BSReadLockGuard guard(physics->worldLock);
+        for (std::int32_t index = 0; index < rayCount; ++index) {
+            ProbeDirection(physics, scale, chest, feet.z, firstHeading + static_cast<float>(index) * turn, range, values);
+        }
+        return values;
+    }
+
+    // How high the ground is at the spot x, y (game units) close to the character "origin", for putting something there
+    // that a character is to walk to. A spot at the height of the character itself hangs in the air or sticks in the
+    // ground wherever the ground is not level. NO_GROUND_HEIGHT if the rays find no ground there
+    float GetGroundHeight(RE::StaticFunctionTag*, RE::Actor* origin, float x, float y) {
+        if (!origin || !origin->Is3DLoaded()) return NO_GROUND_HEIGHT;
+        if (!HasGameAddress(CELL_PHYSICS_ID) || !HasGameAddress(PHYSICS_LOCK_ID) || !HasGameAddress(PHYSICS_UNLOCK_ID)) return NO_GROUND_HEIGHT;
+        const auto* cell = origin->GetParentCell();
+        auto* physics = cell ? cell->GetbhkWorld() : nullptr;
+        if (!physics) return NO_GROUND_HEIGHT;
+        const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+        const float feetHeight = origin->GetPosition().z;
+        const RE::NiPoint3 top(x, y, feetHeight + GROUND_PROBE_UP_UNITS);
+
+        const RE::BSReadLockGuard guard(physics->worldLock);
+        const RayHit below = CastRay(physics, scale, top, RE::NiPoint3(x, y, feetHeight - GROUND_PROBE_DOWN_UNITS));
+        if (below.isHit) return top.z - below.distance;
+        // Nothing below: outdoors the ground may rise there, so that the first ray began inside the hill.
+        // Indoors a ray from higher up would only find the ceiling or the floor above
+        if (cell->IsInteriorCell()) return NO_GROUND_HEIGHT;
+        const RE::NiPoint3 high(x, y, feetHeight + GROUND_PROBE_HIGH_UNITS);
+        const RayHit above = CastRay(physics, scale, high, top);
+        return above.isHit ? high.z - above.distance : NO_GROUND_HEIGHT;
     }
 
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
@@ -1971,6 +2061,8 @@ namespace Companion {
         vm->RegisterFunction("FindByName", SCRIPT_NAME, FindByName);
         vm->RegisterFunction("GetCharactersAround", SCRIPT_NAME, GetCharactersAround);
         vm->RegisterFunction("SetMutedSpeaker", SCRIPT_NAME, SetMutedSpeaker);
+        vm->RegisterFunction("GetSurroundingsToward", SCRIPT_NAME, GetSurroundingsToward);
+        vm->RegisterFunction("GetGroundHeight", SCRIPT_NAME, GetGroundHeight);
         return true;
     }
 
