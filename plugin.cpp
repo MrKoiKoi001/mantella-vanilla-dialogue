@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 20;
+    constexpr std::int32_t INTERFACE_VERSION = 21;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -3683,6 +3683,142 @@ namespace Companion {
         return offer;
     }
 
+    // The functions below exist from interface version 21 on
+
+    // ------------------------------------------------------------ quick state
+    // A script waits for the next picture of the game with nearly every question it asks the game. The state for the
+    // AI took about six seconds that way, most of it for the characters around: several questions per character.
+    // These functions answer many of those questions in one go
+
+    constexpr std::size_t ACTOR_NUMBER_COUNT = 14;
+    constexpr std::int32_t NEARBY_NOT_KNOWN = -1;
+    constexpr std::int32_t NEARBY_RANK_FOUGHT = 0;
+    constexpr std::int32_t NEARBY_RANK_HOSTILE = 1;
+    constexpr std::int32_t NEARBY_RANK_LIVING = 2;
+    constexpr std::int32_t NEARBY_RANK_DEAD = 3;
+
+    std::mutex nearbyLock;
+    // The names that belong to the numbers GetNearbyValues returned last
+    std::vector<std::string> nearbyNames;
+
+    // What a script would ask a character one by one. viewer: from whom the distance and the direction count (None =
+    // both stay 0). The numbers: ref ID, dead, in a fight, position x, y, z, the direction it faces in degrees, weapon
+    // drawn, sneaking, in the loaded area, distance to the viewer in meters, angle from where the viewer faces in
+    // degrees (negative = left), ref ID of whom it fights (0 = nobody), told to wait by the player
+    std::vector<std::int32_t> GetActorNumbers(RE::StaticFunctionTag*, RE::Actor* actor, RE::Actor* viewer) {
+        std::vector<std::int32_t> numbers(ACTOR_NUMBER_COUNT, 0);
+        if (!actor) return numbers;
+        const auto position = actor->GetPosition();
+        numbers[0] = static_cast<std::int32_t>(actor->GetFormID());
+        numbers[1] = actor->IsDead() ? 1 : 0;
+        numbers[2] = actor->IsInCombat() ? 1 : 0;
+        numbers[3] = static_cast<std::int32_t>(position.x);
+        numbers[4] = static_cast<std::int32_t>(position.y);
+        numbers[5] = static_cast<std::int32_t>(position.z);
+        numbers[6] = static_cast<std::int32_t>(actor->GetAngleZ() * DEGREES_PER_RADIAN);
+        const auto* state = actor->AsActorState();
+        numbers[7] = state && state->IsWeaponDrawn() ? 1 : 0;
+        numbers[8] = actor->IsSneaking() ? 1 : 0;
+        numbers[9] = actor->Is3DLoaded() ? 1 : 0;
+        if (viewer && viewer != actor) {
+            const View view = GetViewFrom(viewer, position);
+            numbers[10] = view.distanceMeters;
+            numbers[11] = view.angleDegrees;
+        }
+        const auto fought = actor->GetActorRuntimeData().currentCombatTarget.get();
+        if (fought) numbers[12] = static_cast<std::int32_t>(fought->GetFormID());
+        if (const auto* values = actor->AsActorValueOwner()) numbers[13] = values->GetActorValue(RE::ActorValue::kWaitingForPlayer) > 0.0f ? 1 : 0;
+        return numbers;
+    }
+
+    // The characters around the viewer, living and dead, without the player and the companion, at most maxCharacters
+    // within radiusMeters: whom the companion fights first, then the hostile ones, the other living ones and the dead,
+    // each nearest first. Five numbers per character, as the script built them before: ref ID, distance to the viewer
+    // in meters, angle from where the viewer faces in degrees (negative = left), hostile to the player (for the dead:
+    // how many different items they carry, plus 1), dead. Their names come from GetNearbyNames.
+    // A single -1 means: the plugin cannot look around in this game, the script has to do it itself
+    std::vector<std::int32_t> GetNearbyValues(RE::StaticFunctionTag*, RE::Actor* viewer, RE::Actor* companion, std::int32_t radiusMeters,
+                                              std::int32_t maxCharacters) {
+        std::vector<std::int32_t> values;
+        std::vector<std::string> names;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !viewer || !viewer->Is3DLoaded() || !HasGameAddress(WORLD_SINGLETON_ID)) {
+            const std::lock_guard<std::mutex> guard(nearbyLock);
+            nearbyNames.clear();
+            return {NEARBY_NOT_KNOWN};
+        }
+        struct SeenCharacter {
+            RE::Actor* actor = nullptr;
+            float distance = 0.0f;
+            std::int32_t rank = NEARBY_RANK_LIVING;
+        };
+        const auto foughtHandle = companion ? companion->GetActorRuntimeData().currentCombatTarget.get() : RE::NiPointer<RE::Actor>();
+        const RE::Actor* fought = foughtHandle.get();
+        const bool canTellHostile = HasGameAddress(HOSTILE_TO_ACTOR_ID);
+        std::vector<SeenCharacter> seen;
+        const auto own = viewer->GetPosition();
+        if (radiusMeters > 0 && maxCharacters > 0) {
+            ForEachReferenceAround(viewer, static_cast<float>(radiusMeters) * GAME_UNITS_PER_METER, [&](RE::TESObjectREFR* reference) {
+                if (!reference || reference == viewer || reference == player || reference == companion || reference->IsDisabled() ||
+                    reference->IsMarkedForDeletion()) {
+                    return RE::BSContainer::ForEachResult::kContinue;
+                }
+                auto* actor = reference->As<RE::Actor>();
+                // A character without a body is not in the world right now
+                if (!actor || !actor->Is3DLoaded()) return RE::BSContainer::ForEachResult::kContinue;
+                for (const auto& known : seen) {
+                    if (known.actor == actor) return RE::BSContainer::ForEachResult::kContinue;
+                }
+                SeenCharacter character;
+                character.actor = actor;
+                character.distance = own.GetDistance(actor->GetPosition());
+                if (actor == fought) {
+                    character.rank = NEARBY_RANK_FOUGHT;
+                } else if (actor->IsDead()) {
+                    character.rank = NEARBY_RANK_DEAD;
+                } else if (canTellHostile && actor->IsHostileToActor(player)) {
+                    character.rank = NEARBY_RANK_HOSTILE;
+                }
+                seen.push_back(character);
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+        }
+        std::sort(seen.begin(), seen.end(), [](const SeenCharacter& left, const SeenCharacter& right) {
+            if (left.rank != right.rank) return left.rank < right.rank;
+            return left.distance < right.distance;
+        });
+        if (maxCharacters > 0 && seen.size() > static_cast<std::size_t>(maxCharacters)) seen.resize(static_cast<std::size_t>(maxCharacters));
+        for (const auto& character : seen) {
+            auto* actor = character.actor;
+            const View view = GetViewFrom(viewer, actor->GetPosition());
+            const bool isDead = actor->IsDead();
+            std::int32_t fourth = 0;
+            if (isDead) {
+                fourth = CountLoot(actor) + 1;
+            } else if (canTellHostile && actor->IsHostileToActor(player)) {
+                fourth = 1;
+            }
+            values.push_back(static_cast<std::int32_t>(actor->GetFormID()));
+            values.push_back(view.distanceMeters);
+            values.push_back(view.angleDegrees);
+            values.push_back(fourth);
+            values.push_back(isDead ? 1 : 0);
+            // The place in the list goes in front, so that the server can tell which name belongs to which numbers
+            names.push_back(std::to_string(names.size()) + ":" + CleanText(ViewOf(actor->GetDisplayFullName())));
+        }
+        {
+            const std::lock_guard<std::mutex> guard(nearbyLock);
+            nearbyNames = std::move(names);
+        }
+        return values;
+    }
+
+    // The names of the characters GetNearbyValues listed last: the place in that list, a colon and the name
+    std::vector<std::string> GetNearbyNames(RE::StaticFunctionTag*) {
+        const std::lock_guard<std::mutex> guard(nearbyLock);
+        return nearbyNames;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -3723,6 +3859,9 @@ namespace Companion {
         vm->RegisterFunction("GetMerchantChest", SCRIPT_NAME, GetMerchantChest);
         vm->RegisterFunction("GetMerchantLines", SCRIPT_NAME, GetMerchantLines);
         vm->RegisterFunction("GetTradeOffer", SCRIPT_NAME, GetTradeOffer);
+        vm->RegisterFunction("GetActorNumbers", SCRIPT_NAME, GetActorNumbers);
+        vm->RegisterFunction("GetNearbyValues", SCRIPT_NAME, GetNearbyValues);
+        vm->RegisterFunction("GetNearbyNames", SCRIPT_NAME, GetNearbyNames);
         return true;
     }
 
