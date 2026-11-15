@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 19;
+    constexpr std::int32_t INTERFACE_VERSION = 20;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -260,6 +260,9 @@ namespace Companion {
     constexpr std::uint64_t DISABLE_REFERENCE_ID = 19373;
     // RE::Actor::IsHostileToActor, for the order of GetCharactersAround
     constexpr std::uint64_t HOSTILE_TO_ACTOR_ID = 36537;
+    // RE::InventoryEntryData::GetValue (what an item is worth) and the settings of the game, for trading
+    constexpr std::uint64_t ITEM_VALUE_ID = 15757;
+    constexpr std::uint64_t GAME_SETTINGS_ID = 514622;
     // The file name is these two parts around the version of the game, eg "1-4-15-0"
     constexpr std::string_view ADDRESS_FILE_START = "Data/SKSE/Plugins/version-";
     constexpr std::string_view ADDRESS_FILE_END = ".csv";
@@ -502,7 +505,7 @@ namespace Companion {
     }
 
     // The quests with at least one objective that is shown and not done, tracked quests first
-    std::vector<OpenQuest> CollectOpenQuests() {
+    std::vector<OpenQuest> CollectOpenQuests(std::size_t maxObjectives = MAX_OBJECTIVES_PER_QUEST) {
         std::vector<OpenQuest> quests;
         const auto* entries = GetJournalEntries();
         if (!entries) return quests;
@@ -540,7 +543,7 @@ namespace Companion {
                 quests.push_back(std::move(added));
             }
             auto& openQuest = quests[known->second];
-            if (openQuest.objectives.size() < MAX_OBJECTIVES_PER_QUEST) {
+            if (openQuest.objectives.size() < maxObjectives) {
                 openQuest.objectives.push_back(std::move(text));
                 openQuest.objectiveForms.push_back(objective);
             }
@@ -1664,6 +1667,21 @@ namespace Companion {
     // While the script itself moves things between the companion and the player (give, take), that is no news
     std::atomic<bool> skipsTransfers{ false };
 
+    // The journal as TickEvents saw it last: the quests with an objective that is shown and open (see CheckQuests)
+    struct QuestSample {
+        const RE::TESQuest* quest = nullptr;
+        std::string name;
+        std::vector<const RE::BGSQuestObjective*> objectives;
+        std::vector<std::string> texts;
+    };
+    std::vector<QuestSample> questSamples;
+    bool hasQuestSample = false;
+    // The hostile characters the companion has spotted, with the time, and the traps (see SpotDangers)
+    std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> spottedCharacters;
+    std::unordered_set<RE::FormID> spottedTraps;
+    bool hasSlowCheck = false;
+    std::chrono::steady_clock::time_point lastSlowCheck;
+
     std::int32_t GetGameMinutes() {
         const auto* calendar = RE::Calendar::GetSingleton();
         return calendar ? static_cast<std::int32_t>(calendar->GetHour() * MINUTES_PER_HOUR) : 0;
@@ -2129,6 +2147,11 @@ namespace Companion {
         lastPlayerPlace.clear();
         talkPartnerName.clear();
         hasQuietEnd = false;
+        questSamples.clear();
+        hasQuestSample = false;
+        spottedCharacters.clear();
+        spottedTraps.clear();
+        hasSlowCheck = false;
     }
 
     // The game is running again: a moment later events are kept again (see QUIET_AFTER_LOAD_SECONDS)
@@ -2136,6 +2159,245 @@ namespace Companion {
         const std::lock_guard<std::mutex> guard(eventLock);
         quietEnd = std::chrono::steady_clock::now() + std::chrono::seconds(QUIET_AFTER_LOAD_SECONDS);
         hasQuietEnd = true;
+    }
+
+    // ------------------------------------------------------- quests in the events
+    // The game has events for quests that start, stop and reach a stage, but they come for every quest that runs
+    // unseen in the background. So the plugin compares the journal of the player with how it looked a moment ago:
+    // only what the player is shown gets into the events, and the text of the objective is at hand
+
+    constexpr std::int64_t SLOW_CHECK_SECONDS = 2;
+    constexpr std::size_t MAX_WATCHED_OBJECTIVES = 40;
+    constexpr std::string_view OBJECTIVE_SEPARATOR = "; ";
+
+    // The newest state of an objective in the journal (see GetJournalEntries)
+    RE::QUEST_OBJECTIVE_STATE GetObjectiveState(const RE::BGSQuestObjective* objective) {
+        auto state = RE::QUEST_OBJECTIVE_STATE::kDormant;
+        const auto* entries = GetJournalEntries();
+        if (!entries) return state;
+        for (const auto& entry : *entries) {
+            if (entry.Objective == objective) state = entry.InstanceState;
+        }
+        return state;
+    }
+
+    void AddObjectiveText(std::string& list, std::string_view text) {
+        if (!list.empty()) list += OBJECTIVE_SEPARATOR;
+        list += text;
+    }
+
+    // Keeps an event for every quest that is new in the journal, has a new objective, lost one or is over
+    void CheckQuests() {
+        std::vector<QuestSample> now;
+        for (auto& open : CollectOpenQuests(MAX_WATCHED_OBJECTIVES)) {
+            QuestSample sample;
+            sample.quest = open.quest;
+            sample.name = CleanText(ViewOf(open.quest->GetName()));
+            sample.objectives = std::move(open.objectiveForms);
+            sample.texts = std::move(open.objectives);
+            now.push_back(std::move(sample));
+        }
+        std::vector<std::string> texts;
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            if (hasQuestSample) {
+                for (const auto& sample : now) {
+                    const QuestSample* before = nullptr;
+                    for (const auto& known : questSamples) {
+                        if (known.quest == sample.quest) before = &known;
+                    }
+                    std::string added;
+                    for (std::size_t index = 0; index < sample.objectives.size() && index < sample.texts.size(); ++index) {
+                        if (!before || std::find(before->objectives.begin(), before->objectives.end(), sample.objectives[index]) == before->objectives.end()) {
+                            AddObjectiveText(added, sample.texts[index]);
+                        }
+                    }
+                    if (!before) {
+                        if (added.empty()) continue;
+                        texts.push_back(sample.name.empty() ? "New objective: " + added + "." : "New quest: " + sample.name + ". Objective: " + added + ".");
+                        continue;
+                    }
+                    std::string done;
+                    std::string failed;
+                    for (std::size_t index = 0; index < before->objectives.size() && index < before->texts.size(); ++index) {
+                        if (std::find(sample.objectives.begin(), sample.objectives.end(), before->objectives[index]) != sample.objectives.end()) continue;
+                        const auto state = GetObjectiveState(before->objectives[index]);
+                        if (state == RE::QUEST_OBJECTIVE_STATE::kCompleted || state == RE::QUEST_OBJECTIVE_STATE::kCompletedDisplayed) {
+                            AddObjectiveText(done, before->texts[index]);
+                        } else if (state == RE::QUEST_OBJECTIVE_STATE::kFailed || state == RE::QUEST_OBJECTIVE_STATE::kFailedDisplayed) {
+                            AddObjectiveText(failed, before->texts[index]);
+                        }
+                    }
+                    if (added.empty() && done.empty() && failed.empty()) continue;
+                    std::string text = sample.name.empty() ? "" : "Quest " + sample.name + ".";
+                    if (!done.empty()) text += " Objective done: " + done + ".";
+                    if (!failed.empty()) text += " Objective failed: " + failed + ".";
+                    if (!added.empty()) text += " New objective: " + added + ".";
+                    texts.push_back(std::move(text));
+                }
+                for (const auto& before : questSamples) {
+                    bool isStillOpen = false;
+                    for (const auto& sample : now) {
+                        if (sample.quest == before.quest) isStillOpen = true;
+                    }
+                    if (isStillOpen || !before.quest) continue;
+                    if (before.quest->data.flags.all(RE::QuestFlag::kFailed)) {
+                        texts.push_back(before.name.empty() ? "An objective failed." : "Quest " + before.name + " failed.");
+                        continue;
+                    }
+                    if (before.quest->IsCompleted() && !before.name.empty()) {
+                        texts.push_back("Quest " + before.name + " is completed.");
+                        continue;
+                    }
+                    // The quest goes on without an objective that is shown, or it has no name of its own
+                    std::string done;
+                    for (std::size_t index = 0; index < before.objectives.size() && index < before.texts.size(); ++index) {
+                        const auto state = GetObjectiveState(before.objectives[index]);
+                        if (state == RE::QUEST_OBJECTIVE_STATE::kCompleted || state == RE::QUEST_OBJECTIVE_STATE::kCompletedDisplayed) {
+                            AddObjectiveText(done, before.texts[index]);
+                        }
+                    }
+                    if (done.empty()) continue;
+                    texts.push_back((before.name.empty() ? "" : "Quest " + before.name + ". ") + "Objective done: " + done + ".");
+                }
+            }
+            questSamples = std::move(now);
+            hasQuestSample = true;
+        }
+        for (const auto& text : texts) KeepEvent(text, false, 0);
+    }
+
+    // ---------------------------------------------------------------- dangers
+    // What the companion spots by itself: hostile characters and traps. Only what lies where it faces and what
+    // nothing solid stands in front of: a companion that tells of a trap behind a wall would know more than it can.
+    // Each one becomes an urgent event, so the AI hears of it with the answer to its next command
+
+    constexpr float SPOT_RADIUS_UNITS = 40.0f * GAME_UNITS_PER_METER;
+    constexpr std::int32_t SPOT_HALF_ANGLE_DEGREES = 95;
+    constexpr std::int32_t SPOT_AHEAD_DEGREES = 25;
+    constexpr std::int64_t SPOT_AGAIN_SECONDS = 120;
+    constexpr std::size_t MAX_NAMED_SPOTS = 3;
+    constexpr std::size_t MAX_REMEMBERED_SPOTS = 300;
+
+    struct Spot {
+        RE::FormID referenceID = 0;
+        RE::NiPoint3 position;
+        View view;
+        std::string name;
+    };
+
+    // "25 m ahead of you", "8 m to your left"
+    std::string DescribeSpot(const View& view) {
+        std::string where = std::format("{} m ", view.distanceMeters);
+        if (std::abs(view.angleDegrees) <= SPOT_AHEAD_DEGREES) {
+            where += "ahead of you";
+        } else {
+            where += view.angleDegrees < 0 ? "to your left" : "to your right";
+        }
+        return where;
+    }
+
+    void SpotDangers(RE::Actor* companion) {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!companion || !player || companion->IsDead() || !companion->Is3DLoaded()) return;
+        // Without the physics of the game the walls cannot be checked: then nothing is told at all
+        const auto* cell = companion->GetParentCell();
+        const bool canCastRays = HasGameAddress(CELL_PHYSICS_ID) && HasGameAddress(PHYSICS_LOCK_ID) && HasGameAddress(PHYSICS_UNLOCK_ID);
+        auto* physics = cell && canCastRays ? cell->GetbhkWorld() : nullptr;
+        if (!physics) return;
+
+        std::vector<Spot> characters;
+        std::vector<Spot> traps;
+        // A fight has events of its own, and who fights knows the enemy is there
+        const bool isFighting = player->IsInCombat() || companion->IsInCombat();
+        if (!isFighting && HasGameAddress(HOSTILE_TO_ACTOR_ID)) {
+            ForEachReferenceAround(companion, SPOT_RADIUS_UNITS, [&](RE::TESObjectREFR* reference) {
+                if (!reference || reference == companion || reference == player || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+                    return RE::BSContainer::ForEachResult::kContinue;
+                }
+                auto* actor = reference->As<RE::Actor>();
+                if (!actor || !actor->Is3DLoaded() || actor->IsDead() || actor->IsPlayerTeammate()) return RE::BSContainer::ForEachResult::kContinue;
+                if (!actor->IsHostileToActor(player) && !actor->IsHostileToActor(companion)) return RE::BSContainer::ForEachResult::kContinue;
+                Spot spot;
+                spot.referenceID = actor->GetFormID();
+                spot.position = actor->GetPosition();
+                spot.view = GetViewFrom(companion, spot.position);
+                spot.name = CleanText(ViewOf(actor->GetDisplayFullName()));
+                if (std::abs(spot.view.angleDegrees) <= SPOT_HALF_ANGLE_DEGREES && !spot.name.empty()) characters.push_back(std::move(spot));
+                return RE::BSContainer::ForEachResult::kContinue;
+            });
+        }
+        const float trapRadius = static_cast<float>(DEFAULT_TRAP_RADIUS_METERS) * GAME_UNITS_PER_METER;
+        for (const auto& trap : CollectTraps(companion, trapRadius, DEFAULT_MAX_TRAPS)) {
+            auto* form = RE::TESForm::LookupByID(trap.referenceID);
+            auto* reference = form ? form->AsReference() : nullptr;
+            if (!reference || std::abs(trap.view.angleDegrees) > SPOT_HALF_ANGLE_DEGREES) continue;
+            Spot spot;
+            spot.referenceID = trap.referenceID;
+            spot.position = reference->GetPosition();
+            spot.view = trap.view;
+            spot.name = trap.name;
+            traps.push_back(std::move(spot));
+        }
+        if (characters.empty() && traps.empty()) return;
+
+        // What was told already is left out before the walls are checked, which is the costly part
+        const auto now = std::chrono::steady_clock::now();
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            std::erase_if(characters, [&](const Spot& spot) {
+                const auto known = spottedCharacters.find(spot.referenceID);
+                return known != spottedCharacters.end() && SecondsBetween(known->second, now) < SPOT_AGAIN_SECONDS;
+            });
+            std::erase_if(traps, [&](const Spot& spot) { return spottedTraps.contains(spot.referenceID); });
+        }
+        if (characters.empty() && traps.empty()) return;
+        {
+            const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+            const RE::NiPoint3 feet = companion->GetPosition();
+            const RE::NiPoint3 eyes(feet.x, feet.y, feet.z + SIGHT_EYE_UNITS);
+            const RE::BSReadLockGuard guard(physics->worldLock);
+            std::erase_if(characters, [&](const Spot& spot) { return !IsInSight(physics, scale, eyes, spot.position); });
+            std::erase_if(traps, [&](const Spot& spot) { return !IsInSight(physics, scale, eyes, spot.position); });
+        }
+        if (characters.empty() && traps.empty()) return;
+        std::sort(characters.begin(), characters.end(), [](const Spot& left, const Spot& right) { return left.view.distanceMeters < right.view.distanceMeters; });
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            if (spottedCharacters.size() > MAX_REMEMBERED_SPOTS) spottedCharacters.clear();
+            if (spottedTraps.size() > MAX_REMEMBERED_SPOTS) spottedTraps.clear();
+            for (const auto& spot : characters) spottedCharacters[spot.referenceID] = now;
+            for (const auto& spot : traps) spottedTraps.insert(spot.referenceID);
+        }
+        if (characters.size() == 1) {
+            KeepEvent("You see a hostile " + characters.front().name + " " + DescribeSpot(characters.front().view) + ".", true, 0);
+        } else if (!characters.empty()) {
+            std::string text = "You see hostile characters: ";
+            std::size_t shown = 0;
+            for (const auto& spot : characters) {
+                if (shown == MAX_NAMED_SPOTS) break;
+                if (shown > 0) text += ", ";
+                text += spot.name + " (" + DescribeSpot(spot.view) + ")";
+                ++shown;
+            }
+            if (characters.size() > shown) text += std::format(" and {} more", characters.size() - shown);
+            KeepEvent(text + ".", true, 0);
+        }
+        for (const auto& spot : traps) KeepEvent("You see a trap (" + spot.name + ") " + DescribeSpot(spot.view) + ".", true, 0);
+    }
+
+    // What TickEvents does only every few seconds, because it costs more than a look at the player
+    void RunSlowChecks(RE::Actor* companion) {
+        if (areEventsQuiet.load()) return;
+        const auto now = std::chrono::steady_clock::now();
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            if (hasSlowCheck && SecondsBetween(lastSlowCheck, now) < SLOW_CHECK_SECONDS) return;
+            hasSlowCheck = true;
+            lastSlowCheck = now;
+        }
+        CheckQuests();
+        SpotDangers(companion);
     }
 
     // ------------------------------------------------------------------ books
@@ -2912,6 +3174,8 @@ namespace Companion {
         }
         if (!sneakText.empty()) KeepEvent(sneakText, false, 0);
         if (!fightText.empty()) KeepEvent(fightText, isFighting, SAME_FIGHT_SECONDS);
+        // From interface version 20 on: quests that begin, go on and end, and what the companion spots
+        RunSlowChecks(companion);
     }
 
     // One text per event, its parts separated by tabs: how many seconds ago, the time of day in the game in minutes
@@ -3183,6 +3447,242 @@ namespace Companion {
         return true;
     }
 
+    // The functions below exist from interface version 20 on
+
+    // ------------------------------------------------------------------- heal
+    // The spells a character knows that give health back, strongest first. forOther: those that work on somebody
+    // else (Healing Hands), otherwise those that work on the caster (Healing). For the companion that heals by itself
+    std::vector<RE::SpellItem*> GetHealSpells(RE::StaticFunctionTag*, RE::Actor* caster, bool forOther) {
+        struct HealSpell {
+            RE::SpellItem* spell = nullptr;
+            float strength = 0.0f;
+        };
+        std::vector<HealSpell> found;
+        const auto consider = [&](RE::SpellItem* spell) {
+            if (!spell || spell->GetSpellType() != RE::MagicSystem::SpellType::kSpell || ViewOf(spell->GetName()).empty()) return;
+            for (const auto& known : found) {
+                if (known.spell == spell) return;
+            }
+            const auto delivery = spell->GetDelivery();
+            const bool worksOnOthers = delivery == RE::MagicSystem::Delivery::kAimed || delivery == RE::MagicSystem::Delivery::kTargetActor ||
+                                       delivery == RE::MagicSystem::Delivery::kTouch;
+            if (forOther ? !worksOnOthers : delivery != RE::MagicSystem::Delivery::kSelf) return;
+            // What the spell is, is what its costliest effect does
+            const RE::Effect* strongest = nullptr;
+            for (const auto* effect : spell->effects) {
+                if (effect && effect->baseEffect && (!strongest || effect->cost > strongest->cost)) strongest = effect;
+            }
+            if (!strongest) return;
+            const auto* base = strongest->baseEffect;
+            if (base->GetArchetype() != RE::EffectSetting::Archetype::kValueModifier || base->data.primaryAV != RE::ActorValue::kHealth) return;
+            if (base->IsDetrimental() || base->IsHostile()) return;
+            HealSpell heal;
+            heal.spell = spell;
+            heal.strength = strongest->effectItem.magnitude * static_cast<float>(std::max<std::uint32_t>(strongest->effectItem.duration, 1));
+            found.push_back(heal);
+        };
+        if (caster) {
+            for (auto* spell : caster->GetActorRuntimeData().addedSpells) consider(spell);
+            const auto* base = caster->GetActorBase();
+            const auto* known = base ? base->actorEffects : nullptr;
+            if (known && known->spells) {
+                for (std::uint32_t index = 0; index < known->numSpells; ++index) consider(known->spells[index]);
+            }
+        }
+        std::sort(found.begin(), found.end(), [](const HealSpell& left, const HealSpell& right) { return left.strength > right.strength; });
+        std::vector<RE::SpellItem*> spells;
+        for (const auto& heal : found) spells.push_back(heal.spell);
+        return spells;
+    }
+
+    // ------------------------------------------------------------------ trade
+    // The companion buys from a merchant and sells to one without the barter menu of the game. A merchant is a
+    // character in a faction that has a merchant's chest: what is in that chest is what the merchant sells, and its
+    // gold is what the merchant pays with. Prices follow the rule of the game: the worth of the thing times (buying)
+    // or divided by (selling) a factor that falls from fBarterMax to fBarterMin with the Speech skill of the one who
+    // trades. Perks, potions and enchantments that better prices are left out
+
+    constexpr std::int32_t MERCHANT_TRADES = 0;
+    constexpr std::int32_t MERCHANT_IS_NONE = 1;
+    constexpr std::int32_t MERCHANT_IS_CLOSED = 2;
+    constexpr std::int32_t OFFER_IS_FINE = 0;
+    constexpr std::int32_t OFFER_NOT_DEALT_IN = 3;
+    constexpr std::int32_t OFFER_NONE_THERE = 4;
+    constexpr std::int32_t OFFER_IS_WORTHLESS = 5;
+    constexpr std::int32_t SIDE_MERCHANT_SELLS = 0;
+    constexpr std::int32_t SIDE_COMPANION_SELLS = 1;
+    constexpr RE::FormID GOLD_FORM_ID = 0xF;
+    constexpr float DEFAULT_BARTER_MAX = 3.3f;
+    constexpr float DEFAULT_BARTER_MIN = 2.0f;
+    constexpr float FULL_SKILL = 100.0f;
+    constexpr std::size_t DEFAULT_MAX_WARES = 60;
+
+    const RE::TESFaction* FindVendorFaction(RE::Actor* merchant) {
+        const auto* base = merchant ? merchant->GetActorBase() : nullptr;
+        if (!base) return nullptr;
+        for (const auto& membership : base->factions) {
+            const auto* faction = membership.faction;
+            if (faction && membership.rank >= 0 && faction->vendorData.merchantContainer) return faction;
+        }
+        return nullptr;
+    }
+
+    // Whether the merchant trades at this hour of the day. Hours that are the same mean: always
+    bool IsTradingNow(const RE::TESFaction* faction) {
+        const float start = static_cast<float>(faction->vendorData.vendorValues.startHour);
+        const float end = static_cast<float>(faction->vendorData.vendorValues.endHour);
+        const auto* calendar = RE::Calendar::GetSingleton();
+        if (!calendar || start == end) return true;
+        const float hour = calendar->GetHour();
+        if (start < end) return hour >= start && hour < end;
+        return hour >= start || hour < end;
+    }
+
+    std::int32_t GetMerchantStatus(RE::Actor* merchant, const RE::TESFaction* faction) {
+        if (!merchant || !faction || merchant->IsDead()) return MERCHANT_IS_NONE;
+        return IsTradingNow(faction) ? MERCHANT_TRADES : MERCHANT_IS_CLOSED;
+    }
+
+    // Whether the merchant buys and sells this kind of thing (the list of keywords of its faction)
+    bool DealsIn(const RE::TESFaction* faction, const RE::TESBoundObject* object) {
+        auto* list = faction->vendorData.vendorSellBuyList;
+        if (!list) return true;
+        const bool isListed = object->HasKeywordInList(list, false);
+        return faction->vendorData.vendorValues.notBuySell ? !isListed : isListed;
+    }
+
+    std::int32_t GetBaseValue(const RE::TESBoundObject* object) {
+        if (HasGameAddress(ITEM_VALUE_ID)) return std::max(object->GetGoldValue(), 0);
+        const auto* valued = object->As<RE::TESValueForm>();
+        return valued ? std::max(valued->value, 0) : 0;
+    }
+
+    float GetBarterSetting(const char* name, float usual) {
+        if (!HasGameAddress(GAME_SETTINGS_ID)) return usual;
+        auto* settings = RE::GameSettingCollection::GetSingleton();
+        const auto* setting = settings ? settings->GetSetting(name) : nullptr;
+        return setting ? setting->GetFloat() : usual;
+    }
+
+    // What one piece costs the trader (isBuying) or brings the trader
+    std::int32_t GetTradePrice(const RE::TESBoundObject* object, RE::Actor* trader, bool isBuying) {
+        const float value = static_cast<float>(GetBaseValue(object));
+        if (value <= 0.0f) return 0;
+        const float highest = GetBarterSetting("fBarterMax", DEFAULT_BARTER_MAX);
+        const float lowest = GetBarterSetting("fBarterMin", DEFAULT_BARTER_MIN);
+        float skill = 0.0f;
+        if (const auto* values = trader ? trader->AsActorValueOwner() : nullptr) skill = values->GetActorValue(RE::ActorValue::kSpeech);
+        const float factor = std::max(highest - (highest - lowest) * std::clamp(skill, 0.0f, FULL_SKILL) / FULL_SKILL, 1.0f);
+        if (isBuying) return std::max(static_cast<std::int32_t>(std::lround(value * factor)), 1);
+        return static_cast<std::int32_t>(std::lround(value / factor));
+    }
+
+    std::int32_t CountInInventory(RE::TESObjectREFR* holder, RE::FormID formID) {
+        if (!holder) return 0;
+        for (const auto& [object, entry] : holder->GetInventory()) {
+            if (object && object->GetFormID() == formID) return std::max(entry.first, 0);
+        }
+        return 0;
+    }
+
+    // The chest a merchant sells from and pays out of, or nothing if the character is no merchant
+    RE::TESObjectREFR* GetMerchantChest(RE::StaticFunctionTag*, RE::Actor* merchant) {
+        const auto* faction = FindVendorFaction(merchant);
+        return faction ? faction->vendorData.merchantContainer : nullptr;
+    }
+
+    // What a merchant offers and what the companion could sell to it. The first text, its parts separated by tabs:
+    // ref ID of the merchant as eight hex digits, status (0 = trades, 1 = no merchant, 2 = does not trade at this
+    // hour), gold of the merchant, gold of the buyer, the hours it trades from and to, how many kinds of wares it
+    // has, how many kinds of things the buyer could sell, name. Then one text per thing, at most maxItems per side:
+    // side (0 = the merchant sells it, 1 = the buyer could sell it), form ID as eight hex digits, how many, form
+    // type as SKSE numbers it, price of one piece, name
+    std::vector<std::string> GetMerchantLines(RE::StaticFunctionTag*, RE::Actor* merchant, RE::Actor* buyer, std::int32_t maxItems) {
+        std::vector<std::string> lines;
+        if (!merchant) return lines;
+        const auto* faction = FindVendorFaction(merchant);
+        const std::int32_t status = GetMerchantStatus(merchant, faction);
+        auto* chest = faction ? faction->vendorData.merchantContainer : nullptr;
+        const std::size_t limit = maxItems > 0 ? static_cast<std::size_t>(maxItems) : DEFAULT_MAX_WARES;
+        std::size_t wareCount = 0;
+        std::size_t sellCount = 0;
+        std::int32_t merchantGold = 0;
+        std::int32_t buyerGold = 0;
+        // The first text is only known at the end
+        lines.emplace_back();
+        if (chest) {
+            for (const auto& [object, entry] : chest->GetInventory()) {
+                if (!object || entry.first <= 0 || object->Is(RE::FormType::LeveledItem)) continue;
+                if (object->GetFormID() == GOLD_FORM_ID) {
+                    merchantGold = entry.first;
+                    continue;
+                }
+                const std::string name = CleanText(ViewOf(object->GetName()));
+                const std::int32_t price = GetTradePrice(object, buyer, true);
+                if (name.empty() || price <= 0) continue;
+                ++wareCount;
+                if (wareCount > limit) continue;
+                lines.push_back(std::format("{}\t{:08X}\t{}\t{}\t{}\t{}", SIDE_MERCHANT_SELLS, object->GetFormID(), entry.first,
+                                            static_cast<std::int32_t>(object->GetFormType()), price, name));
+            }
+        }
+        if (buyer) {
+            for (const auto& [object, entry] : buyer->GetInventory()) {
+                if (!object || entry.first <= 0 || object->Is(RE::FormType::LeveledItem)) continue;
+                if (object->GetFormID() == GOLD_FORM_ID) {
+                    buyerGold = entry.first;
+                    continue;
+                }
+                if (!faction) continue;
+                const auto* data = entry.second.get();
+                if (data && data->IsWorn()) continue;
+                const std::string name = CleanText(ViewOf(object->GetName()));
+                const std::int32_t price = GetTradePrice(object, buyer, false);
+                if (name.empty() || price <= 0 || !DealsIn(faction, object)) continue;
+                ++sellCount;
+                if (sellCount > limit) continue;
+                lines.push_back(std::format("{}\t{:08X}\t{}\t{}\t{}\t{}", SIDE_COMPANION_SELLS, object->GetFormID(), entry.first,
+                                            static_cast<std::int32_t>(object->GetFormType()), price, name));
+            }
+        }
+        const std::int32_t startHour = faction ? static_cast<std::int32_t>(faction->vendorData.vendorValues.startHour) : 0;
+        const std::int32_t endHour = faction ? static_cast<std::int32_t>(faction->vendorData.vendorValues.endHour) : 0;
+        lines[0] = std::format("{:08X}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", merchant->GetFormID(), status, merchantGold, buyerGold, startHour, endHour,
+                               wareCount, sellCount, CleanText(ViewOf(merchant->GetDisplayFullName())));
+        return lines;
+    }
+
+    // One thing the companion wants to buy from a merchant (isBuying) or sell to it. Four numbers: status (0 = fine,
+    // 1 = no merchant, 2 = does not trade at this hour, 3 = the merchant does not deal in this kind of thing,
+    // 4 = none there, 5 = it is worth nothing), price of one piece, how many there are (in the chest of the merchant
+    // when buying, with the buyer when selling), and the gold of the one who pays (the buyer when buying, the merchant
+    // when selling)
+    std::vector<std::int32_t> GetTradeOffer(RE::StaticFunctionTag*, RE::Actor* merchant, RE::Actor* buyer, RE::TESForm* item, bool isBuying) {
+        std::vector<std::int32_t> offer = {MERCHANT_IS_NONE, 0, 0, 0};
+        const auto* faction = FindVendorFaction(merchant);
+        auto* chest = faction ? faction->vendorData.merchantContainer : nullptr;
+        offer[0] = GetMerchantStatus(merchant, faction);
+        if (offer[0] != MERCHANT_TRADES || !chest || !buyer) return offer;
+        const auto* object = item ? item->As<RE::TESBoundObject>() : nullptr;
+        if (!object || object->GetFormID() == GOLD_FORM_ID) {
+            offer[0] = OFFER_NONE_THERE;
+            return offer;
+        }
+        offer[1] = GetTradePrice(object, buyer, isBuying);
+        offer[2] = CountInInventory(isBuying ? chest : static_cast<RE::TESObjectREFR*>(buyer), object->GetFormID());
+        offer[3] = CountInInventory(isBuying ? static_cast<RE::TESObjectREFR*>(buyer) : chest, GOLD_FORM_ID);
+        if (offer[2] <= 0) {
+            offer[0] = OFFER_NONE_THERE;
+        } else if (!isBuying && !DealsIn(faction, object)) {
+            offer[0] = OFFER_NOT_DEALT_IN;
+        } else if (offer[1] <= 0) {
+            offer[0] = OFFER_IS_WORTHLESS;
+        } else {
+            offer[0] = OFFER_IS_FINE;
+        }
+        return offer;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -3219,6 +3719,10 @@ namespace Companion {
         vm->RegisterFunction("GetHandCastState", SCRIPT_NAME, GetHandCastState);
         vm->RegisterFunction("GetInventoryLines", SCRIPT_NAME, GetInventoryLines);
         vm->RegisterFunction("SetTalkTarget", SCRIPT_NAME, SetTalkTarget);
+        vm->RegisterFunction("GetHealSpells", SCRIPT_NAME, GetHealSpells);
+        vm->RegisterFunction("GetMerchantChest", SCRIPT_NAME, GetMerchantChest);
+        vm->RegisterFunction("GetMerchantLines", SCRIPT_NAME, GetMerchantLines);
+        vm->RegisterFunction("GetTradeOffer", SCRIPT_NAME, GetTradeOffer);
         return true;
     }
 
