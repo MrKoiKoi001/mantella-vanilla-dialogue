@@ -21,6 +21,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <numbers>
 #include <string>
@@ -35,7 +36,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 17;
+    constexpr std::int32_t INTERFACE_VERSION = 19;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -134,6 +135,24 @@ namespace Companion {
     // so that an empty container (2) can be told from one of an older plugin that does not count (0)
     constexpr std::int32_t CONTAINER_COUNT_STEP = 2;
     constexpr std::int32_t LOOT_UNKNOWN = -1;
+    // Inventories (see GetInventoryLines): what to list, the flags of an item, and the numbers for the kinds of armor.
+    // The same numbers as in KI_MCP_Gefaehrte_Loop.psc of the game mod and game_state.py of the companion server
+    constexpr std::int32_t INVENTORY_FAVORITES = 1;
+    constexpr std::int32_t INVENTORY_EQUIPPED = 2;
+    constexpr std::size_t DEFAULT_MAX_INVENTORY_ITEMS = 120;
+    constexpr std::int32_t ITEM_IS_EQUIPPED = 1;
+    constexpr std::int32_t ITEM_IS_FAVORITE = 2;
+    constexpr std::int32_t ITEM_KIND_STEP = 16;
+    constexpr std::int32_t ITEM_KIND_SHIELD = 20;
+    constexpr std::int32_t ITEM_KIND_BODY = 21;
+    constexpr std::int32_t ITEM_KIND_HEAD = 22;
+    constexpr std::int32_t ITEM_KIND_HANDS = 23;
+    constexpr std::int32_t ITEM_KIND_FEET = 24;
+    constexpr std::int32_t ITEM_KIND_AMULET = 25;
+    constexpr std::int32_t ITEM_KIND_RING = 26;
+    constexpr std::int32_t ITEM_KIND_OTHER_ARMOR = 27;
+    // What GetHandCastState returns for a character that cannot cast
+    constexpr std::int32_t CAST_STATE_UNKNOWN = -1;
     constexpr std::int32_t DEFAULT_THING_RADIUS_METERS = 10;
     // Tables are no furniture for the game: they are scenery without a name. They are told by the file name of their
     // model, which holds this word (eg nobletablelong01.nif, commontablesquare01.nif) ...
@@ -2989,6 +3008,175 @@ namespace Companion {
         return lines;
     }
 
+    // The six functions below exist from interface version 18 on
+
+    // Runs a command of the console of the game on a reference, as if it were typed there with that reference picked.
+    // Only call this on the main thread of the game (a task of SKSE)
+    void RunConsoleCommand(RE::TESObjectREFR* target, const std::string& command) {
+        const auto factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::Script>();
+        auto* script = factory ? factory->Create() : nullptr;
+        if (!script) return;
+        script->SetCommand(command);
+        script->CompileAndRun(target);
+        delete script;
+    }
+
+    // Sneaking: the game makes a follower ("teammate") sneak exactly when the player sneaks, and a script that
+    // switches the sneaking of such a character is overruled within a moment. The console command SetForceSneak
+    // forces a character that is no player to enter or to leave the sneaking state and to stay that way.
+    // Returns whether the command could be handed to the game. It runs a moment later, on the main thread
+    bool SetForceSneak(RE::StaticFunctionTag*, RE::Actor* actor, bool shouldSneak) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!actor || !tasks) return false;
+        const auto handle = actor->GetHandle();
+        tasks->AddTask([handle, shouldSneak]() {
+            const auto sneaker = handle.get();
+            if (sneaker) RunConsoleCommand(sneaker.get(), shouldSneak ? "SetForceSneak 1" : "SetForceSneak 0");
+        });
+        return true;
+    }
+
+    // What casts the spell a character holds in its right hand
+    RE::MagicCaster* GetRightHandCaster(RE::Actor* actor) {
+        return actor ? actor->GetMagicCaster(RE::MagicSystem::CastingSource::kRightHand) : nullptr;
+    }
+
+    // Makes a character do one of the actions of the game (as pressing or letting go of the attack button does for
+    // the player). Only call this on the main thread of the game
+    void DoAction(RE::Actor* actor, RE::DEFAULT_OBJECT actionID) {
+        const auto* defaults = RE::BGSDefaultObjectManager::GetSingleton();
+        auto* action = defaults ? defaults->GetObject<RE::BGSAction>(actionID) : nullptr;
+        if (!actor || !action) return;
+        std::unique_ptr<RE::TESActionData> data(RE::TESActionData::Create());
+        if (!data) return;
+        data->source = RE::NiPointer<RE::TESObjectREFR>(actor);
+        data->action = action;
+        data->Process();
+    }
+
+    // Casting by hand: a spell cast by a script (Spell.Cast) has no movement and comes out of the head of the
+    // character. This lets the character cast the spell it holds in its right hand the way the game itself does it:
+    // with the movement of the hand, out of the hand, and paid for with magicka. target is what the spell is aimed
+    // at (None = nothing in particular). The spell has to be in the right hand and the hands have to be raised
+    // (weapon drawn). Returns whether it could be handed to the game. It runs a moment later, on the main thread
+    bool StartHandCast(RE::StaticFunctionTag*, RE::Actor* actor, RE::TESObjectREFR* target) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!tasks || !GetRightHandCaster(actor)) return false;
+        const auto handle = actor->GetHandle();
+        const auto targetHandle = target ? target->GetHandle() : RE::ObjectRefHandle();
+        tasks->AddTask([handle, targetHandle]() {
+            const auto casting = handle.get();
+            if (!casting) return;
+            if (auto* caster = GetRightHandCaster(casting.get())) caster->desiredTarget = targetHandle;
+            DoAction(casting.get(), RE::DEFAULT_OBJECT::kActionRightAttack);
+        });
+        return true;
+    }
+
+    // Lets go of the spell: one that is charged flies off, one that is held (flames) stops
+    bool EndHandCast(RE::StaticFunctionTag*, RE::Actor* actor) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!actor || !tasks) return false;
+        const auto handle = actor->GetHandle();
+        tasks->AddTask([handle]() {
+            const auto casting = handle.get();
+            if (casting) DoAction(casting.get(), RE::DEFAULT_OBJECT::kActionRightRelease);
+        });
+        return true;
+    }
+
+    // How far the right hand of a character is with casting, as the game numbers it: 0 = it does nothing,
+    // 5 = it charges the spell, 6 = it casts. -1 = cannot tell
+    std::int32_t GetHandCastState(RE::StaticFunctionTag*, RE::Actor* actor) {
+        const auto* caster = GetRightHandCaster(actor);
+        return caster ? static_cast<std::int32_t>(caster->state.underlying()) : CAST_STATE_UNKNOWN;
+    }
+
+    // What kind of weapon or armor an item is, as the script numbers it (GetItemKind there): for a weapon its type
+    // plus one, for armor a number by the part of the body it covers, 0 for everything else
+    std::int32_t GetItemKind(RE::TESBoundObject* object) {
+        if (const auto* weapon = object->As<RE::TESObjectWEAP>()) return static_cast<std::int32_t>(weapon->GetWeaponType()) + 1;
+        const auto* armor = object->As<RE::TESObjectARMO>();
+        if (!armor) return 0;
+        using Slot = RE::BGSBipedObjectForm::BipedObjectSlot;
+        if (armor->HasPartOf(Slot::kShield)) return ITEM_KIND_SHIELD;
+        if (armor->HasPartOf(Slot::kBody)) return ITEM_KIND_BODY;
+        if (armor->HasPartOf(Slot::kHead) || armor->HasPartOf(Slot::kHair) || armor->HasPartOf(Slot::kCirclet)) return ITEM_KIND_HEAD;
+        if (armor->HasPartOf(Slot::kHands)) return ITEM_KIND_HANDS;
+        if (armor->HasPartOf(Slot::kFeet)) return ITEM_KIND_FEET;
+        if (armor->HasPartOf(Slot::kAmulet)) return ITEM_KIND_AMULET;
+        if (armor->HasPartOf(Slot::kRing)) return ITEM_KIND_RING;
+        return ITEM_KIND_OTHER_ARMOR;
+    }
+
+    // An inventory in one go. A script has to ask the game several questions per item, which takes seconds for a
+    // full inventory and more than the server waits for the inventory of a player who carries a lot.
+    // filter: 0 = everything, 1 = only the favorites, 2 = only what is worn and held. The favorites of the player are
+    // what the game has among its favorites; for everybody else they are the items in "marked" (the companion marks
+    // its own, see the command favorite). The first text is how many kinds of items passed the filter, then one text
+    // per item, at most maxItems, its parts separated by tabs: form ID as eight hex digits, how many, form type as
+    // SKSE numbers it, flags (1 = worn or held, plus 2 = favorite, plus 16 times the kind of weapon or armor), name
+    std::vector<std::string> GetInventoryLines(RE::StaticFunctionTag*, RE::TESObjectREFR* owner, std::int32_t filter, std::int32_t maxItems,
+                                               std::vector<RE::TESForm*> marked) {
+        std::vector<std::string> lines;
+        if (!owner) return lines;
+        const std::size_t limit = maxItems > 0 ? static_cast<std::size_t>(maxItems) : DEFAULT_MAX_INVENTORY_ITEMS;
+        const bool isPlayer = owner->IsPlayerRef();
+        std::size_t total = 0;
+        // The total comes first. It is only known at the end
+        lines.emplace_back();
+        for (const auto& [object, entry] : owner->GetInventory()) {
+            if (!object || entry.first <= 0 || object->Is(RE::FormType::LeveledItem)) continue;
+            const std::string name = CleanText(ViewOf(object->GetName()));
+            if (name.empty()) continue;
+            const auto* data = entry.second.get();
+            const bool isEquipped = data && data->IsWorn();
+            bool isFavorite = false;
+            if (isPlayer) {
+                isFavorite = data && data->IsFavorited();
+            } else {
+                isFavorite = std::find(marked.begin(), marked.end(), static_cast<RE::TESForm*>(object)) != marked.end();
+            }
+            if (filter == INVENTORY_FAVORITES && !isFavorite) continue;
+            if (filter == INVENTORY_EQUIPPED && !isEquipped) continue;
+            ++total;
+            if (total > limit) continue;
+            const std::int32_t flags = (isEquipped ? ITEM_IS_EQUIPPED : 0) + (isFavorite ? ITEM_IS_FAVORITE : 0) + ITEM_KIND_STEP * GetItemKind(object);
+            lines.push_back(std::format("{:08X}\t{}\t{}\t{}\t{}", object->GetFormID(), entry.first, static_cast<std::int32_t>(object->GetFormType()), flags, name));
+        }
+        lines[0] = std::to_string(total);
+        return lines;
+    }
+
+    // The function below exists from interface version 19 on
+
+    // Whom a character looks at while it speaks. The game keeps several things a character can look at, and the
+    // one of a dialogue comes before the one a script sets (Actor.SetLookAt). A line spoken with Actor.Say makes the
+    // game put the player there, so a companion that spoke to somebody else kept its eyes off them. This puts
+    // "target" there instead (None = nobody: what the script set counts again).
+    // Returns whether it could be handed to the game. It runs a moment later, on the main thread
+    bool SetTalkTarget(RE::StaticFunctionTag*, RE::Actor* speaker, RE::TESObjectREFR* target) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!speaker || !tasks) return false;
+        const auto handle = speaker->GetHandle();
+        const bool hasTarget = target != nullptr;
+        const auto targetHandle = target ? target->GetHandle() : RE::ObjectRefHandle();
+        tasks->AddTask([handle, hasTarget, targetHandle]() {
+            const auto talking = handle.get();
+            if (!talking) return;
+            auto* process = talking->GetActorRuntimeData().currentProcess;
+            auto* high = process ? process->high : nullptr;
+            if (!high) return;
+            if (!hasTarget) {
+                high->ClearHeadtrackTarget(RE::HighProcessData::HEAD_TRACK_TYPE::kDialogue, false);
+                return;
+            }
+            const auto lookedAt = targetHandle.get();
+            if (lookedAt) high->SetHeadtrackTarget(RE::HighProcessData::HEAD_TRACK_TYPE::kDialogue, lookedAt.get());
+        });
+        return true;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -3019,6 +3207,12 @@ namespace Companion {
         vm->RegisterFunction("TakeUrgentEvents", SCRIPT_NAME, TakeUrgentEvents);
         vm->RegisterFunction("SkipTransferEvents", SCRIPT_NAME, SkipTransferEvents);
         vm->RegisterFunction("GetBookText", SCRIPT_NAME, GetBookText);
+        vm->RegisterFunction("SetForceSneak", SCRIPT_NAME, SetForceSneak);
+        vm->RegisterFunction("StartHandCast", SCRIPT_NAME, StartHandCast);
+        vm->RegisterFunction("EndHandCast", SCRIPT_NAME, EndHandCast);
+        vm->RegisterFunction("GetHandCastState", SCRIPT_NAME, GetHandCastState);
+        vm->RegisterFunction("GetInventoryLines", SCRIPT_NAME, GetInventoryLines);
+        vm->RegisterFunction("SetTalkTarget", SCRIPT_NAME, SetTalkTarget);
         return true;
     }
 
