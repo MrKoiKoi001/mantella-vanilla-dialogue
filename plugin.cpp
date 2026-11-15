@@ -35,7 +35,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 14;
+    constexpr std::int32_t INTERFACE_VERSION = 15;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -197,6 +197,13 @@ namespace Companion {
     constexpr float NO_GROUND_HEIGHT = -1000000.0f;
     // The rays start at chest height, outside the body of the character
     constexpr float RAY_HEIGHT_UNITS = 90.0f;
+    // Sight: the rays start at the eyes of the viewer and go to three heights of the thing (a door stands on its
+    // position). What a ray meets this close to the thing counts as the thing itself: a door is solid, and so is its frame
+    constexpr float SIGHT_EYE_UNITS = 110.0f;
+    constexpr std::array<float, 3> SIGHT_TARGET_HEIGHTS = {30.0f, 90.0f, 150.0f};
+    constexpr float SIGHT_TARGET_UNITS = 150.0f;
+    // GetNearbyPlaces: the places are not filtered by what the viewer can see
+    constexpr std::int32_t NO_SIGHT_FILTER = -1;
     constexpr float RAY_START_UNITS = 30.0f;
     // A surface whose normal points up at least this much is ground one can walk on, not a wall
     constexpr float WALKABLE_NORMAL_UP = 0.6f;
@@ -1200,6 +1207,21 @@ namespace Companion {
 
     std::int32_t ToWholeMeters(float gameUnits) { return static_cast<std::int32_t>(std::lround(gameUnits / GAME_UNITS_PER_METER)); }
 
+    // Whether nothing solid of the world lies between the eyes of a viewer and a thing at this position.
+    // The game itself can only tell that for the player and between characters (Actor.HasLOS).
+    // Like the game the rays go to three heights, and one that gets through is enough.
+    // Only call this while the physics are locked for reading
+    bool IsInSight(RE::bhkWorld* physics, float scale, const RE::NiPoint3& eyes, const RE::NiPoint3& position) {
+        for (const float height : SIGHT_TARGET_HEIGHTS) {
+            const RE::NiPoint3 point(position.x, position.y, position.z + height);
+            const float length = (point - eyes).Length();
+            if (length <= SIGHT_TARGET_UNITS) return true;
+            const RayHit hit = CastRay(physics, scale, eyes, point);
+            if (!hit.isHit || hit.distance >= length - SIGHT_TARGET_UNITS) return true;
+        }
+        return false;
+    }
+
     // ---------------------------------------------------------------- hearing
     // The game calls SubtitleManager::ShowSubtitle for every line a character near the player speaks and it would
     // show as a subtitle: lines of a dialogue, and what characters say in passing (the game calls those "general subtitles").
@@ -1703,16 +1725,11 @@ namespace Companion {
         return lines;
     }
 
-    // The places around the viewer (origin, or the player - see GetViewer), map markers first, then doors, each nearest first:
-    // at most maxMarkers map markers within radiusMeters (none indoors), and at most maxDoors doors in the loaded area
-    // within radiusMeters that lead into another area. One text per place, its parts separated by tabs:
-    // kind (0 = map marker, 1 = door), ref ID of the marker or the door as eight hex digits,
-    // distance to the viewer in meters, angle from where the viewer faces in degrees
-    // (negative = left), for a map marker the kind of place as the game numbers it (13 = farm, 21 = stable ...; 0 for a door),
-    // for a map marker 1 if the player has been there (0 otherwise, and for a door),
-    // name of the place, for a door the name of the place it leads to
-    std::vector<std::string> GetNearbyPlaces(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxMarkers, std::int32_t maxDoors,
-                                             RE::Actor* origin) {
+    // The lines of GetNearbyPlaces and GetVisiblePlaces. halfAngleDegrees: NO_SIGHT_FILTER = every place around,
+    // otherwise only the places that lie within this many degrees to the left and right of where the viewer faces
+    // and have nothing solid between them and the eyes of the viewer
+    std::vector<std::string> GetPlaceLines(std::int32_t radiusMeters, std::int32_t maxMarkers, std::int32_t maxDoors, RE::Actor* origin,
+                                           std::int32_t halfAngleDegrees) {
         std::vector<std::string> lines;
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return lines;
@@ -1727,6 +1744,31 @@ namespace Companion {
         if (doorLimit > 0) {
             auto doors = CollectDoors(viewer, radius, doorLimit);
             for (auto& door : doors) places.push_back(std::move(door));
+        }
+        if (halfAngleDegrees > NO_SIGHT_FILTER) {
+            std::vector<Place> ahead;
+            for (auto& place : places) {
+                if (std::abs(place.view.angleDegrees) <= halfAngleDegrees) ahead.push_back(std::move(place));
+            }
+            places = std::move(ahead);
+            // Without the physics of the game the walls cannot be checked: then it stays with the direction
+            const auto* cell = viewer->Is3DLoaded() ? viewer->GetParentCell() : nullptr;
+            const bool canCastRays = HasGameAddress(CELL_PHYSICS_ID) && HasGameAddress(PHYSICS_LOCK_ID) && HasGameAddress(PHYSICS_UNLOCK_ID);
+            auto* physics = cell && canCastRays ? cell->GetbhkWorld() : nullptr;
+            if (physics) {
+                const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+                const RE::NiPoint3 feet = viewer->GetPosition();
+                const RE::NiPoint3 eyes(feet.x, feet.y, feet.z + SIGHT_EYE_UNITS);
+                std::vector<Place> seen;
+                const RE::BSReadLockGuard guard(physics->worldLock);
+                for (auto& place : places) {
+                    auto* form = place.referenceID != 0 ? RE::TESForm::LookupByID(place.referenceID) : nullptr;
+                    auto* reference = form ? form->AsReference() : nullptr;
+                    // A place the game cannot find any more is not held back
+                    if (!reference || IsInSight(physics, scale, eyes, reference->GetPosition())) seen.push_back(std::move(place));
+                }
+                places = std::move(seen);
+            }
         }
         for (const auto& place : places) {
             std::string line = std::to_string(place.kind);
@@ -1744,8 +1786,29 @@ namespace Companion {
             line += place.name;
             lines.push_back(std::move(line));
         }
-        logger::debug("GetNearbyPlaces: {} places sent", lines.size());
+        logger::debug("GetPlaceLines: {} places sent", lines.size());
         return lines;
+    }
+
+    // The places around the viewer (origin, or the player - see GetViewer), map markers first, then doors, each nearest first:
+    // at most maxMarkers map markers within radiusMeters (none indoors), and at most maxDoors doors in the loaded area
+    // within radiusMeters that lead into another area. One text per place, its parts separated by tabs:
+    // kind (0 = map marker, 1 = door), ref ID of the marker or the door as eight hex digits,
+    // distance to the viewer in meters, angle from where the viewer faces in degrees
+    // (negative = left), for a map marker the kind of place as the game numbers it (13 = farm, 21 = stable ...; 0 for a door),
+    // for a map marker 1 if the player has been there (0 otherwise, and for a door),
+    // name of the place, for a door the name of the place it leads to
+    std::vector<std::string> GetNearbyPlaces(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxMarkers, std::int32_t maxDoors,
+                                             RE::Actor* origin) {
+        return GetPlaceLines(radiusMeters, maxMarkers, maxDoors, origin, NO_SIGHT_FILTER);
+    }
+
+    // Like GetNearbyPlaces, but only the places the viewer can see: within halfAngleDegrees to the left and right of
+    // where it faces, and with no wall between its eyes and the place (rays through the physics of the game).
+    // Without this a companion "saw" doors through walls
+    std::vector<std::string> GetVisiblePlaces(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxMarkers, std::int32_t maxDoors,
+                                              RE::Actor* origin, std::int32_t halfAngleDegrees) {
+        return GetPlaceLines(radiusMeters, maxMarkers, maxDoors, origin, std::max(halfAngleDegrees, 0));
     }
 
     // The things close to the viewer (origin, or the player - see GetViewer): furniture first, then containers,
@@ -2073,6 +2136,7 @@ namespace Companion {
         vm->RegisterFunction("GetSurroundingsToward", SCRIPT_NAME, GetSurroundingsToward);
         vm->RegisterFunction("GetGroundHeight", SCRIPT_NAME, GetGroundHeight);
         vm->RegisterFunction("GetMount", SCRIPT_NAME, GetMount);
+        vm->RegisterFunction("GetVisiblePlaces", SCRIPT_NAME, GetVisiblePlaces);
         return true;
     }
 
