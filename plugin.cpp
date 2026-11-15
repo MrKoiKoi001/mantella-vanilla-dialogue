@@ -33,6 +33,12 @@
 #include "PCH.h"
 #include "logger.h"
 
+// Windows.h (comes in with logger.h) renames GetObject to GetObjectA. That breaks
+// RE::BGSDefaultObjectManager::GetObject, which the PCH read under its real name
+#ifdef GetObject
+#undef GetObject
+#endif
+
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
