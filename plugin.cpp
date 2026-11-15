@@ -35,7 +35,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 15;
+    constexpr std::int32_t INTERFACE_VERSION = 16;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -130,6 +130,10 @@ namespace Companion {
     // For furniture: a character can sit on it. For a container: it is locked
     constexpr std::int32_t FURNITURE_IS_SEAT = 1;
     constexpr std::int32_t CONTAINER_IS_LOCKED = 1;
+    // The flag of a container that is not locked: this times (the number of different items in it + 1),
+    // so that an empty container (2) can be told from one of an older plugin that does not count (0)
+    constexpr std::int32_t CONTAINER_COUNT_STEP = 2;
+    constexpr std::int32_t LOOT_UNKNOWN = -1;
     constexpr std::int32_t DEFAULT_THING_RADIUS_METERS = 10;
     // Tables are no furniture for the game: they are scenery without a name. They are told by the file name of their
     // model, which holds this word (eg nobletablelong01.nif, commontablesquare01.nif) ...
@@ -865,6 +869,22 @@ namespace Companion {
         std::string name;
     };
 
+    // How many different items a container holds or a dead character carries that can be taken: the ones the loot
+    // menu of the game would show. Lists the game has not rolled out yet, things that are not for the player
+    // (the claws of an animal) and things without a name do not count. LOOT_UNKNOWN without a holder
+    std::int32_t CountLoot(RE::TESObjectREFR* holder) {
+        if (!holder) return LOOT_UNKNOWN;
+        std::int32_t kinds = 0;
+        for (const auto& [object, entry] : holder->GetInventory()) {
+            if (!object || entry.first <= 0) continue;
+            if (object->Is(RE::FormType::LeveledItem) || !object->GetPlayable()) continue;
+            const char* name = object->GetName();
+            if (!name || name[0] == '\0') continue;
+            ++kinds;
+        }
+        return kinds;
+    }
+
     // Which kind of thing a reference is by what it is made from, or -1 if it is nothing for this list
     std::int32_t GetThingKind(const RE::TESBoundObject* base) {
         switch (base->GetFormType()) {
@@ -974,7 +994,12 @@ namespace Companion {
                 if (furniture && furniture->furnFlags.any(RE::TESFurniture::ActiveMarker::kCanSit)) thing.flags = FURNITURE_IS_SEAT;
             } else if (kind == THING_IS_CONTAINER) {
                 const auto* extra = reference->extraList.GetByType<RE::ExtraLock>();
-                if (extra && extra->lock && extra->lock->IsLocked()) thing.flags = CONTAINER_IS_LOCKED;
+                if (extra && extra->lock && extra->lock->IsLocked()) {
+                    thing.flags = CONTAINER_IS_LOCKED;
+                } else {
+                    // Nobody can look into a locked container. An open one tells whether it is worth opening
+                    thing.flags = CONTAINER_COUNT_STEP * (CountLoot(reference) + 1);
+                }
             }
             thingsByKind[static_cast<std::size_t>(kind)].push_back(std::move(thing));
             return RE::BSContainer::ForEachResult::kContinue;
@@ -1816,7 +1841,7 @@ namespace Companion {
     // One text per thing, its parts separated by tabs:
     // kind (0 = furniture, 1 = container, 2 = item), ref ID as eight hex digits, distance to the viewer in meters,
     // angle from where the viewer faces in degrees (negative = left),
-    // for furniture 1 if a character can sit on it, for a container 1 if it is locked (0 otherwise), name
+    // for furniture 1 if a character can sit on it, for a container 1 if it is locked, otherwise 2 x (the number of different items in it + 1), name
     std::vector<std::string> GetNearbyThings(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxPerKind, RE::Actor* origin) {
         std::vector<std::string> lines;
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -2113,6 +2138,10 @@ namespace Companion {
         return mount.get();
     }
 
+    // How many different items a dead character carries or a container holds that can be taken (see CountLoot),
+    // so that a companion does not have to open every body to find out that it is empty. -1 = cannot tell
+    std::int32_t GetLootCount(RE::StaticFunctionTag*, RE::TESObjectREFR* holder) { return CountLoot(holder); }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -2137,6 +2166,7 @@ namespace Companion {
         vm->RegisterFunction("GetGroundHeight", SCRIPT_NAME, GetGroundHeight);
         vm->RegisterFunction("GetMount", SCRIPT_NAME, GetMount);
         vm->RegisterFunction("GetVisiblePlaces", SCRIPT_NAME, GetVisiblePlaces);
+        vm->RegisterFunction("GetLootCount", SCRIPT_NAME, GetLootCount);
         return true;
     }
 
