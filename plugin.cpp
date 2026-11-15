@@ -35,7 +35,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 16;
+    constexpr std::int32_t INTERFACE_VERSION = 17;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -1536,11 +1536,730 @@ namespace Companion {
         return true;
     }
 
+    // ----------------------------------------------------------------- events
+    // What happens around the player and the companion, kept with the time it happened, for the AI that plays the
+    // companion. The game tells its events to whoever registered for them; the plugin keeps one short text per event.
+    // Some things have no event of the game (the player begins to fight or to sneak): for those the script calls
+    // TickEvents about once a second, and the plugin compares with what it saw the time before. The same call ends
+    // what is counted together: the hits the player or the companion takes, and the things the player takes.
+    // The script fetches the kept texts when the companion server asks for the state (TakeEvents). The urgent ones
+    // (a fight begins, someone dies) already go out with its next request to the server (TakeUrgentEvents).
+    // The companion is called "you" in the texts, because the AI that reads them plays it.
+
+    constexpr std::size_t MAX_STORED_EVENTS = 40;
+    constexpr std::int64_t MAX_EVENT_AGE_SECONDS = 600;
+    constexpr std::size_t MAX_EVENT_TEXT_LENGTH = 260;
+    // The same text again within this time is no new event (a door used twice, a spell cast again and again)
+    constexpr std::int64_t SAME_EVENT_SECONDS = 10;
+    // Characters in a fight lose their target and find it again. That is one fight
+    constexpr std::int64_t SAME_FIGHT_SECONDS = 30;
+    constexpr std::size_t MAX_REMEMBERED_EVENTS = 30;
+    // A death or a fight further away from the player than this is not kept
+    constexpr float EVENT_RADIUS_UNITS = 40.0f * GAME_UNITS_PER_METER;
+    // The hits someone takes become one event. It ends after this long without a hit, or when it has lasted HIT_LONGEST_SECONDS
+    constexpr std::int64_t HIT_QUIET_SECONDS = 4;
+    constexpr std::int64_t HIT_LONGEST_SECONDS = 12;
+    // The things the player takes become one event per container. It ends after this long without another thing
+    constexpr std::int64_t TAKE_QUIET_SECONDS = 2;
+    constexpr std::size_t MAX_NAMED_ITEMS = 6;
+    constexpr std::size_t MAX_NAMED_ATTACKERS = 3;
+    // Someone who is left with less health than this after being hit is urgent news
+    constexpr float LOW_HEALTH_PERCENT = 30.0f;
+    constexpr float FULL_PERCENT = 100.0f;
+    // Right after a save was loaded the game reports everything the player wears as just put on. Nothing is kept that long
+    constexpr std::int64_t QUIET_AFTER_LOAD_SECONDS = 5;
+    constexpr float MINUTES_PER_HOUR = 60.0f;
+    // Whose hits and health are watched
+    constexpr std::size_t WATCHED_PLAYER = 0;
+    constexpr std::size_t WATCHED_COMPANION = 1;
+    constexpr std::size_t WATCHED_COUNT = 2;
+    // The ref ID every game gives the player
+    constexpr RE::FormID PLAYER_REFERENCE_ID = 0x14;
+    constexpr std::string_view DIALOGUE_MENU_NAME = "Dialogue Menu";
+    constexpr std::string_view LOCKPICKING_MENU_NAME = "Lockpicking Menu";
+
+    struct GameEvent {
+        std::string text;
+        std::chrono::steady_clock::time_point time;
+        // The time of day in the game, in minutes since midnight
+        std::int32_t gameMinutes = 0;
+        bool isUrgent = false;
+    };
+
+    struct NameCount {
+        std::string name;
+        std::int32_t count = 0;
+    };
+
+    struct Health {
+        float now = 0.0f;
+        float full = 0.0f;
+        bool isKnown = false;
+    };
+
+    // The hits one character takes in a row
+    struct HitRun {
+        bool isActive = false;
+        std::int32_t hitCount = 0;
+        Health before;
+        std::chrono::steady_clock::time_point firstTime;
+        std::chrono::steady_clock::time_point lastTime;
+        std::vector<NameCount> attackers;
+    };
+
+    // The things the player takes out of one container in a row, or hands to the companion
+    struct TakeRun {
+        bool isActive = false;
+        RE::FormID sourceID = 0;
+        bool isGift = false;
+        std::string sourceName;
+        std::chrono::steady_clock::time_point lastTime;
+        std::vector<NameCount> items;
+    };
+
+    std::mutex eventLock;
+    std::deque<GameEvent> gameEvents;
+    // The events that were kept last, so that the same one is not kept twice. gameEvents is emptied when it is fetched
+    std::deque<GameEvent> rememberedEvents;
+    std::array<HitRun, WATCHED_COUNT> hitRuns;
+    // The health of the player and of the companion as TickEvents saw it last, while nobody was hitting them
+    std::array<Health, WATCHED_COUNT> sampledHealth;
+    TakeRun takeRun;
+    bool hasPlayerSample = false;
+    bool wasPlayerSneaking = false;
+    bool wasPlayerFighting = false;
+    std::string lastPlayerPlace;
+    std::string talkPartnerName;
+    bool hasQuietEnd = false;
+    std::chrono::steady_clock::time_point quietEnd;
+    // Whether nothing is kept at the moment: a save is being loaded, or was loaded a moment ago
+    std::atomic<bool> areEventsQuiet{ false };
+    // The ref ID of the companion, as the script tells it with every TickEvents (0 = there is none)
+    std::atomic<RE::FormID> eventCompanionID{ 0 };
+    // While the script itself moves things between the companion and the player (give, take), that is no news
+    std::atomic<bool> skipsTransfers{ false };
+
+    std::int32_t GetGameMinutes() {
+        const auto* calendar = RE::Calendar::GetSingleton();
+        return calendar ? static_cast<std::int32_t>(calendar->GetHour() * MINUTES_PER_HOUR) : 0;
+    }
+
+    // Only call this while eventLock is held
+    void PushEventLocked(std::string text, bool isUrgent, std::chrono::steady_clock::time_point now, std::int32_t gameMinutes,
+                         std::int64_t sameSeconds = SAME_EVENT_SECONDS) {
+        if (text.empty() || areEventsQuiet.load()) return;
+        while (!rememberedEvents.empty() && SecondsBetween(rememberedEvents.front().time, now) >= SAME_FIGHT_SECONDS) rememberedEvents.pop_front();
+        for (const auto& known : rememberedEvents) {
+            if (known.text == text && SecondsBetween(known.time, now) < sameSeconds) return;
+        }
+        GameEvent kept;
+        kept.text = std::move(text);
+        kept.time = now;
+        kept.gameMinutes = gameMinutes;
+        kept.isUrgent = isUrgent;
+        rememberedEvents.push_back(kept);
+        while (rememberedEvents.size() > MAX_REMEMBERED_EVENTS) rememberedEvents.pop_front();
+        gameEvents.push_back(std::move(kept));
+        while (gameEvents.size() > MAX_STORED_EVENTS) gameEvents.pop_front();
+    }
+
+    void KeepEvent(std::string_view rawText, bool isUrgent = false, std::int64_t sameSeconds = SAME_EVENT_SECONDS) {
+        std::string text = CleanText(rawText, MAX_EVENT_TEXT_LENGTH);
+        const auto now = std::chrono::steady_clock::now();
+        const std::int32_t gameMinutes = GetGameMinutes();
+        const std::lock_guard<std::mutex> guard(eventLock);
+        PushEventLocked(std::move(text), isUrgent, now, gameMinutes, sameSeconds);
+    }
+
+    bool IsEventCompanion(const RE::TESObjectREFR* reference) {
+        const RE::FormID companionID = eventCompanionID.load();
+        return reference && companionID != 0 && reference->GetFormID() == companionID;
+    }
+
+    bool IsWatched(const RE::TESObjectREFR* reference) { return reference && (reference->IsPlayerRef() || IsEventCompanion(reference)); }
+
+    // How the texts call a character or a thing. isFirst: the name begins a sentence
+    std::string GetEventName(RE::TESObjectREFR* reference, bool isFirst) {
+        if (reference) {
+            if (reference->IsPlayerRef()) return isFirst ? "The player" : "the player";
+            if (IsEventCompanion(reference)) return isFirst ? "You" : "you";
+            std::string name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            if (!name.empty()) return name;
+        }
+        return isFirst ? "Someone" : "someone";
+    }
+
+    bool IsNearPlayer(const RE::TESObjectREFR* reference) {
+        const auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !reference) return false;
+        return player->GetPosition().GetDistance(reference->GetPosition()) <= EVENT_RADIUS_UNITS;
+    }
+
+    Health ReadHealth(RE::Actor* actor) {
+        Health health;
+        const auto* values = actor ? actor->AsActorValueOwner() : nullptr;
+        if (!values) return health;
+        health.now = values->GetActorValue(RE::ActorValue::kHealth);
+        health.full = values->GetPermanentActorValue(RE::ActorValue::kHealth);
+        health.isKnown = true;
+        return health;
+    }
+
+    void AddNameCount(std::vector<NameCount>& list, std::string_view name, std::int32_t count) {
+        for (auto& entry : list) {
+            if (entry.name == name) {
+                entry.count += count;
+                return;
+            }
+        }
+        NameCount entry;
+        entry.name = std::string(name);
+        entry.count = count;
+        list.push_back(std::move(entry));
+    }
+
+    // "Wolf (2), Bandit and 3 more": the names with their numbers where they are above one, at most limit of them
+    std::string ListNameCounts(const std::vector<NameCount>& list, std::size_t limit) {
+        std::string text;
+        std::size_t shown = 0;
+        for (const auto& entry : list) {
+            if (shown == limit) break;
+            if (shown > 0) text += ", ";
+            text += entry.name;
+            if (entry.count > 1) text += std::format(" ({})", entry.count);
+            ++shown;
+        }
+        if (list.size() > shown) text += std::format(" and {} more", list.size() - shown);
+        return text;
+    }
+
+    // Ends the hits the watched character took in a row and keeps them as one event. Only call this while eventLock is held.
+    // after: the health of that character now
+    void EndHitRunLocked(std::size_t watched, const Health& after, std::chrono::steady_clock::time_point now, std::int32_t gameMinutes) {
+        HitRun& run = hitRuns[watched];
+        if (!run.isActive) return;
+        run.isActive = false;
+        std::string text = watched == WATCHED_PLAYER ? "The player" : "You";
+        text += run.hitCount == 1 ? " took a hit" : std::format(" took {} hits", run.hitCount);
+        if (!run.attackers.empty()) text += " from " + ListNameCounts(run.attackers, MAX_NAMED_ATTACKERS);
+        bool isUrgent = false;
+        if (after.isKnown && after.full > 0.0f) {
+            const float percent = std::clamp(after.now / after.full * FULL_PERCENT, 0.0f, FULL_PERCENT);
+            const float lost = run.before.isKnown ? run.before.now - after.now : 0.0f;
+            if (lost >= 1.0f) {
+                text += std::format(" and lost about {} health ({}% left)", FormatNumber(lost), FormatNumber(percent));
+            } else {
+                text += std::format(" ({}% health left)", FormatNumber(percent));
+            }
+            isUrgent = percent < LOW_HEALTH_PERCENT;
+        }
+        text += ".";
+        // Hits are counted, so two events of them never say the same thing twice
+        PushEventLocked(std::move(text), isUrgent, now, gameMinutes, 0);
+    }
+
+    // Ends the things the player took in a row and keeps them as one event. Only call this while eventLock is held
+    void EndTakeRunLocked(std::chrono::steady_clock::time_point now, std::int32_t gameMinutes) {
+        if (!takeRun.isActive) return;
+        takeRun.isActive = false;
+        if (takeRun.items.empty()) return;
+        std::string text;
+        if (takeRun.isGift) {
+            text = "The player gave you: ";
+        } else if (takeRun.sourceName.empty()) {
+            text = "The player got: ";
+        } else {
+            text = "The player took from " + takeRun.sourceName + ": ";
+        }
+        text += ListNameCounts(takeRun.items, MAX_NAMED_ITEMS) + ".";
+        PushEventLocked(std::move(text), false, now, gameMinutes, 0);
+    }
+
+    // Ends what is counted together once it has been quiet for long enough (isAll: in any case).
+    // The health of the two watched characters is read before the lock is taken, because that asks the game
+    void EndRuns(bool isAll) {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        const RE::FormID companionID = eventCompanionID.load();
+        auto* companion = companionID != 0 ? RE::TESForm::LookupByID<RE::Actor>(companionID) : nullptr;
+        std::array<Health, WATCHED_COUNT> health;
+        health[WATCHED_PLAYER] = ReadHealth(player);
+        health[WATCHED_COMPANION] = ReadHealth(companion);
+        const auto now = std::chrono::steady_clock::now();
+        const std::int32_t gameMinutes = GetGameMinutes();
+
+        const std::lock_guard<std::mutex> guard(eventLock);
+        if (areEventsQuiet.load() && hasQuietEnd && now >= quietEnd) {
+            areEventsQuiet.store(false);
+            hasQuietEnd = false;
+        }
+        for (std::size_t watched = 0; watched < WATCHED_COUNT; ++watched) {
+            HitRun& run = hitRuns[watched];
+            if (run.isActive) {
+                const bool isOver = SecondsBetween(run.lastTime, now) >= HIT_QUIET_SECONDS || SecondsBetween(run.firstTime, now) >= HIT_LONGEST_SECONDS;
+                if (isAll || isOver) EndHitRunLocked(watched, health[watched], now, gameMinutes);
+            }
+            if (!run.isActive) sampledHealth[watched] = health[watched];
+        }
+        if (takeRun.isActive && (isAll || SecondsBetween(takeRun.lastTime, now) >= TAKE_QUIET_SECONDS)) EndTakeRunLocked(now, gameMinutes);
+    }
+
+    void OnCombatEvent(const RE::TESCombatEvent& event) {
+        auto* fighter = event.actor.get();
+        auto* target = event.targetActor.get();
+        if (!fighter) return;
+        if (event.newState == RE::ACTOR_COMBAT_STATE::kCombat) {
+            if (IsEventCompanion(fighter)) {
+                KeepEvent("You started fighting " + GetEventName(target, false) + ".", false, SAME_FIGHT_SECONDS);
+            } else if (IsWatched(target)) {
+                KeepEvent(GetEventName(fighter, true) + " started fighting " + GetEventName(target, false) + ".", true, SAME_FIGHT_SECONDS);
+            }
+        } else if (event.newState == RE::ACTOR_COMBAT_STATE::kNone && IsEventCompanion(fighter)) {
+            KeepEvent("You stopped fighting.", false, SAME_FIGHT_SECONDS);
+        }
+    }
+
+    void OnDeathEvent(const RE::TESDeathEvent& event) {
+        auto* victim = event.actorDying.get();
+        auto* killer = event.actorKiller.get();
+        if (!victim) return;
+        if (!IsWatched(victim) && !IsWatched(killer) && !IsNearPlayer(victim)) return;
+        // The game tells a death twice (dying, dead). The second one has the same text and is dropped
+        if (killer && killer != victim) {
+            KeepEvent(GetEventName(killer, true) + " killed " + GetEventName(victim, false) + ".", true);
+        } else {
+            KeepEvent(GetEventName(victim, true) + " died.", true);
+        }
+    }
+
+    void OnHitEvent(const RE::TESHitEvent& event) {
+        auto* target = event.target.get();
+        auto* attacker = event.cause.get();
+        if (!IsWatched(target) || attacker == target) return;
+        const std::size_t watched = target->IsPlayerRef() ? WATCHED_PLAYER : WATCHED_COMPANION;
+        const std::string attackerName = attacker ? GetEventName(attacker, false) : std::string();
+        const Health health = ReadHealth(target->As<RE::Actor>());
+        const auto now = std::chrono::steady_clock::now();
+
+        const std::lock_guard<std::mutex> guard(eventLock);
+        if (areEventsQuiet.load()) return;
+        HitRun& run = hitRuns[watched];
+        if (!run.isActive) {
+            run = HitRun();
+            run.isActive = true;
+            run.firstTime = now;
+            // What TickEvents saw a moment ago is the health before this hit. Without it: the health of this moment
+            run.before = sampledHealth[watched].isKnown ? sampledHealth[watched] : health;
+        }
+        ++run.hitCount;
+        run.lastTime = now;
+        if (!attackerName.empty()) AddNameCount(run.attackers, attackerName, 1);
+    }
+
+    void OnLocationEvent(const RE::TESActorLocationChangeEvent& event) {
+        const auto* mover = event.actor.get();
+        if (!mover || !mover->IsPlayerRef()) return;
+        const std::string newName = event.newLoc ? CleanText(ViewOf(event.newLoc->GetFullName())) : std::string();
+        const std::string oldName = event.oldLoc ? CleanText(ViewOf(event.oldLoc->GetFullName())) : std::string();
+        std::string text;
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            if (!newName.empty()) {
+                if (newName == lastPlayerPlace) return;
+                lastPlayerPlace = newName;
+                text = "The player entered " + newName + ".";
+            } else if (!oldName.empty()) {
+                lastPlayerPlace.clear();
+                text = "The player left " + oldName + ".";
+            }
+        }
+        if (!text.empty()) KeepEvent(text);
+    }
+
+    void OnActivateEvent(const RE::TESActivateEvent& event) {
+        auto* thing = event.objectActivated.get();
+        const auto* user = event.actionRef.get();
+        if (!thing || !user || !user->IsPlayerRef()) return;
+        if (const auto* character = thing->As<RE::Actor>()) {
+            // Speaking to someone shows as the dialogue menu, getting on a horse shows in the state
+            if (character->IsDead() && !IsEventCompanion(thing)) KeepEvent("The player searched the body of " + GetEventName(thing, false) + ".");
+            return;
+        }
+        const auto* base = thing->GetBaseObject();
+        if (!base) return;
+        const std::string name = CleanText(ViewOf(thing->GetDisplayFullName()));
+        switch (base->GetFormType()) {
+            case RE::FormType::Door: {
+                const std::string place = GetNameBehindDoor(thing);
+                if (!place.empty()) {
+                    KeepEvent("The player used the door to " + place + ".");
+                } else if (!name.empty()) {
+                    KeepEvent("The player used the door '" + name + "'.");
+                }
+                break;
+            }
+            case RE::FormType::Container:
+                if (name.empty()) break;
+                KeepEvent(thing->IsLocked() ? "The player tried the locked " + name + "." : "The player opened " + name + ".");
+                break;
+            case RE::FormType::Activator:
+            case RE::FormType::TalkingActivator:
+            case RE::FormType::Furniture:
+                if (!name.empty()) KeepEvent("The player used " + name + ".");
+                break;
+            default:
+                // Things that are picked up show when they change hands, a book shows when it is read
+                break;
+        }
+    }
+
+    void OnBookReadEvent(const RE::TESBookReadEvent& event) {
+        const auto* book = RE::TESForm::LookupByID<RE::TESObjectBOOK>(event.baseFormID);
+        if (!book) return;
+        const std::string title = CleanText(ViewOf(book->GetName()));
+        if (title.empty()) return;
+        const char* kind = "the book";
+        if (book->TeachesSpell()) {
+            kind = "the spell tome";
+        } else if (book->IsNoteScroll()) {
+            kind = "the note";
+        }
+        KeepEvent(std::format("The player read {} '{}' (ID {:08X}).", kind, title, book->GetFormID()));
+    }
+
+    void OnContainerEvent(const RE::TESContainerChangedEvent& event) {
+        if (skipsTransfers.load() || event.itemCount <= 0) return;
+        const RE::FormID companionID = eventCompanionID.load();
+        const bool isGift = companionID != 0 && event.newContainer == companionID && event.oldContainer == PLAYER_REFERENCE_ID;
+        if (!isGift && event.newContainer != PLAYER_REFERENCE_ID) return;
+        const auto* item = RE::TESForm::LookupByID(event.baseObj);
+        const std::string itemName = item ? CleanText(ViewOf(item->GetName())) : std::string();
+        if (itemName.empty()) return;
+        const RE::FormID sourceID = isGift ? 0 : event.oldContainer;
+        std::string sourceName;
+        if (sourceID != 0) {
+            auto* sourceForm = RE::TESForm::LookupByID(sourceID);
+            auto* source = sourceForm ? sourceForm->AsReference() : nullptr;
+            if (source) {
+                const auto* holder = source->As<RE::Actor>();
+                sourceName = GetEventName(source, false);
+                if (holder && holder->IsDead() && !IsEventCompanion(source)) sourceName = "the body of " + sourceName;
+            }
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const std::int32_t gameMinutes = GetGameMinutes();
+
+        const std::lock_guard<std::mutex> guard(eventLock);
+        if (areEventsQuiet.load()) return;
+        if (takeRun.isActive && (takeRun.sourceID != sourceID || takeRun.isGift != isGift)) EndTakeRunLocked(now, gameMinutes);
+        if (!takeRun.isActive) {
+            takeRun = TakeRun();
+            takeRun.isActive = true;
+            takeRun.sourceID = sourceID;
+            takeRun.isGift = isGift;
+            takeRun.sourceName = sourceName;
+        }
+        takeRun.lastTime = now;
+        AddNameCount(takeRun.items, itemName, event.itemCount);
+    }
+
+    void OnEquipEvent(const RE::TESEquipEvent& event) {
+        const auto* wearer = event.actor.get();
+        if (!event.equipped || !wearer || !wearer->IsPlayerRef()) return;
+        const auto* item = RE::TESForm::LookupByID(event.baseObject);
+        if (!item) return;
+        const std::string name = CleanText(ViewOf(item->GetName()));
+        if (name.empty()) return;
+        switch (item->GetFormType()) {
+            case RE::FormType::Weapon:
+            case RE::FormType::Armor:
+            case RE::FormType::Light:
+                KeepEvent("The player equipped " + name + ".");
+                break;
+            case RE::FormType::Scroll:
+                KeepEvent("The player took the scroll " + name + " in hand.");
+                break;
+            case RE::FormType::AlchemyItem: {
+                const auto* potion = item->As<RE::AlchemyItem>();
+                if (potion && potion->IsPoison()) {
+                    KeepEvent("The player used the poison " + name + ".");
+                } else if (potion && potion->IsFood()) {
+                    KeepEvent("The player ate or drank " + name + ".");
+                } else {
+                    KeepEvent("The player drank " + name + ".");
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    void OnSpellCastEvent(const RE::TESSpellCastEvent& event) {
+        const auto* caster = event.object.get();
+        if (!caster || !caster->IsPlayerRef()) return;
+        const auto* spell = RE::TESForm::LookupByID(event.spell);
+        // Potions, enchantments and scrolls come here as well. Only real spells count
+        if (!spell || !spell->Is(RE::FormType::Spell)) return;
+        const std::string name = CleanText(ViewOf(spell->GetName()));
+        if (!name.empty()) KeepEvent("The player cast " + name + ".");
+    }
+
+    void OnBleedoutEvent(const RE::TESEnterBleedoutEvent& event) {
+        auto* fallen = event.actor.get();
+        if (!fallen || fallen->IsPlayerRef()) return;
+        const auto* character = fallen->As<RE::Actor>();
+        if (IsEventCompanion(fallen)) {
+            KeepEvent("You went down and are bleeding out.", true);
+        } else if (character && character->IsPlayerTeammate()) {
+            KeepEvent(GetEventName(fallen, true) + " went down and is bleeding out.", true);
+        }
+    }
+
+    void OnMenuEvent(const RE::MenuOpenCloseEvent& event) {
+        const auto menuName = ViewOf(event.menuName.c_str());
+        if (menuName == LOCKPICKING_MENU_NAME) {
+            if (event.opening) KeepEvent("The player started picking a lock.");
+            return;
+        }
+        if (menuName != DIALOGUE_MENU_NAME) return;
+        std::string partnerName;
+        if (event.opening) {
+            const auto* topics = RE::MenuTopicManager::GetSingleton();
+            const auto partner = topics ? topics->speaker.get() : RE::NiPointer<RE::TESObjectREFR>();
+            if (partner) partnerName = GetEventName(partner.get(), false);
+        }
+        std::string text;
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            if (event.opening) {
+                talkPartnerName = partnerName;
+                text = partnerName.empty() ? "The player started a conversation." : "The player started talking to " + partnerName + ".";
+            } else {
+                text = talkPartnerName.empty() ? "The player ended the conversation." : "The player stopped talking to " + talkPartnerName + ".";
+                talkPartnerName.clear();
+            }
+        }
+        KeepEvent(text, false, 0);
+    }
+
+    // One listener per kind of event. Whatever goes wrong in a handler must not reach the game
+    template <class Event, void (*Handler)(const Event&)>
+    class EventListener final : public RE::BSTEventSink<Event> {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(const Event* event, RE::BSTEventSource<Event>*) override {
+            try {
+                if (event && !areEventsQuiet.load()) Handler(*event);
+            } catch (...) {
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
+    EventListener<RE::TESCombatEvent, OnCombatEvent> combatListener;
+    EventListener<RE::TESDeathEvent, OnDeathEvent> deathListener;
+    EventListener<RE::TESHitEvent, OnHitEvent> hitListener;
+    EventListener<RE::TESActorLocationChangeEvent, OnLocationEvent> locationListener;
+    EventListener<RE::TESActivateEvent, OnActivateEvent> activateListener;
+    EventListener<RE::TESBookReadEvent, OnBookReadEvent> bookReadListener;
+    EventListener<RE::TESContainerChangedEvent, OnContainerEvent> containerListener;
+    EventListener<RE::TESEquipEvent, OnEquipEvent> equipListener;
+    EventListener<RE::TESSpellCastEvent, OnSpellCastEvent> spellCastListener;
+    EventListener<RE::TESEnterBleedoutEvent, OnBleedoutEvent> bleedoutListener;
+    EventListener<RE::MenuOpenCloseEvent, OnMenuEvent> menuListener;
+    bool areListenersInstalled = false;
+
+    // Registers for the events of the game. They only exist once the game has loaded its data
+    void InstallEventListeners() {
+        if (areListenersInstalled) return;
+        auto* events = RE::ScriptEventSourceHolder::GetSingleton();
+        if (!events) {
+            logger::warn("Events: the game has no source of events, so nothing is kept of what happens.");
+            return;
+        }
+        events->AddEventSink<RE::TESCombatEvent>(&combatListener);
+        events->AddEventSink<RE::TESDeathEvent>(&deathListener);
+        events->AddEventSink<RE::TESHitEvent>(&hitListener);
+        events->AddEventSink<RE::TESActorLocationChangeEvent>(&locationListener);
+        events->AddEventSink<RE::TESActivateEvent>(&activateListener);
+        events->AddEventSink<RE::TESBookReadEvent>(&bookReadListener);
+        events->AddEventSink<RE::TESContainerChangedEvent>(&containerListener);
+        events->AddEventSink<RE::TESEquipEvent>(&equipListener);
+        events->AddEventSink<RE::TESSpellCastEvent>(&spellCastListener);
+        events->AddEventSink<RE::TESEnterBleedoutEvent>(&bleedoutListener);
+        if (auto* menus = RE::UI::GetSingleton()) menus->AddEventSink<RE::MenuOpenCloseEvent>(&menuListener);
+        areListenersInstalled = true;
+        logger::info("Events: listening to what happens in the game.");
+    }
+
+    // What happened before a save is loaded or a new game starts belongs to another game
+    void ForgetEvents() {
+        areEventsQuiet.store(true);
+        const std::lock_guard<std::mutex> guard(eventLock);
+        gameEvents.clear();
+        rememberedEvents.clear();
+        for (auto& run : hitRuns) run = HitRun();
+        for (auto& health : sampledHealth) health = Health();
+        takeRun = TakeRun();
+        hasPlayerSample = false;
+        lastPlayerPlace.clear();
+        talkPartnerName.clear();
+        hasQuietEnd = false;
+    }
+
+    // The game is running again: a moment later events are kept again (see QUIET_AFTER_LOAD_SECONDS)
+    void AllowEventsSoon() {
+        const std::lock_guard<std::mutex> guard(eventLock);
+        quietEnd = std::chrono::steady_clock::now() + std::chrono::seconds(QUIET_AFTER_LOAD_SECONDS);
+        hasQuietEnd = true;
+    }
+
+    // ------------------------------------------------------------------ books
+    // The text of a book or a note, for a companion that reads it. The game keeps it as the description of the book,
+    // with its own marks in it: [pagebreak], <font ...>, <p align=...>, <br>, pictures. They are taken out, what is
+    // left is cut into paragraphs, and the paragraphs into pages of about BOOK_PAGE_BYTES.
+    // A note can name a character or a place of a quest with <Alias=Name>. The game fills that in when it shows
+    // the note; here it stays as [Name], because the plugin does not know which quest the note belongs to
+
+    constexpr std::size_t BOOK_PAGE_BYTES = 3000;
+    // A page goes to the script in pieces: one long text is more than the way through the script is known to take
+    constexpr std::size_t BOOK_PIECE_BYTES = 400;
+    constexpr std::int32_t BOOK_IS_BOOK = 0;
+    constexpr std::int32_t BOOK_IS_NOTE = 1;
+    constexpr std::int32_t BOOK_IS_SPELL_TOME = 2;
+    // How a piece joins what came before it: it begins a paragraph, it goes on after a blank, or it goes on right away
+    constexpr std::int32_t PIECE_BEGINS_PARAGRAPH = 1;
+    constexpr std::int32_t PIECE_FOLLOWS_BLANK = 0;
+    constexpr std::int32_t PIECE_FOLLOWS_DIRECTLY = 2;
+    constexpr std::string_view PAGE_BREAK_MARK = "[pagebreak]";
+
+    struct BookPiece {
+        std::int32_t join = PIECE_BEGINS_PARAGRAPH;
+        std::string text;
+    };
+
+    // Adds what was collected as a paragraph, with single blanks and none at its ends
+    void EndParagraph(std::string& collected, std::vector<std::string>& paragraphs) {
+        std::string paragraph;
+        bool isBlankPending = false;
+        for (const char letter : collected) {
+            if (static_cast<unsigned char>(letter) <= 0x20) {
+                isBlankPending = !paragraph.empty();
+                continue;
+            }
+            if (isBlankPending) paragraph += ' ';
+            isBlankPending = false;
+            paragraph += letter;
+        }
+        collected.clear();
+        if (!paragraph.empty()) paragraphs.push_back(std::move(paragraph));
+    }
+
+    // The paragraphs of a book text without the marks of the game
+    std::vector<std::string> ReadParagraphs(std::string_view raw) {
+        const std::string text = IsValidUtf(raw) ? std::string(raw) : FromWindowsText(raw);
+        std::vector<std::string> paragraphs;
+        std::string collected;
+        std::size_t index = 0;
+        while (index < text.size()) {
+            const char letter = text[index];
+            if (letter == '\n') {
+                EndParagraph(collected, paragraphs);
+                ++index;
+                continue;
+            }
+            if (letter == '[' && StartsWithIgnoreCase(std::string_view(text).substr(index), PAGE_BREAK_MARK)) {
+                EndParagraph(collected, paragraphs);
+                index += PAGE_BREAK_MARK.size();
+                continue;
+            }
+            if (letter == '<') {
+                const std::size_t end = text.find('>', index);
+                if (end != std::string::npos) {
+                    const std::string_view tag = std::string_view(text).substr(index + 1, end - index - 1);
+                    const bool isBreak = StartsWithIgnoreCase(tag, "br") || StartsWithIgnoreCase(tag, "/p") || EqualsIgnoreCase(tag, "p") ||
+                                         StartsWithIgnoreCase(tag, "p ");
+                    const std::size_t equals = tag.find('=');
+                    if (isBreak) {
+                        EndParagraph(collected, paragraphs);
+                    } else if ((StartsWithIgnoreCase(tag, "alias") || StartsWithIgnoreCase(tag, "global")) && equals != std::string_view::npos) {
+                        collected += '[';
+                        collected += tag.substr(equals + 1);
+                        collected += ']';
+                    } else {
+                        // Fonts, pictures and the like. A blank keeps the words on both sides apart
+                        collected += ' ';
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+            collected += letter;
+            ++index;
+        }
+        EndParagraph(collected, paragraphs);
+        return paragraphs;
+    }
+
+    // Cuts a paragraph into pieces of at most BOOK_PIECE_BYTES, at a blank where there is one
+    void AddPieces(const std::string& paragraph, std::vector<BookPiece>& pieces) {
+        std::size_t start = 0;
+        std::int32_t join = PIECE_BEGINS_PARAGRAPH;
+        while (start < paragraph.size()) {
+            std::size_t end = paragraph.size();
+            std::int32_t nextJoin = PIECE_FOLLOWS_BLANK;
+            std::size_t nextStart = end;
+            if (end - start > BOOK_PIECE_BYTES) {
+                end = start + BOOK_PIECE_BYTES;
+                const std::size_t blank = paragraph.rfind(' ', end);
+                if (blank != std::string::npos && blank > start) {
+                    end = blank;
+                    nextStart = blank + 1;
+                } else {
+                    // No blank to cut at. Do not cut a letter of several bytes in the middle
+                    while (end > start + 1 && IsFollowByte(static_cast<unsigned char>(paragraph[end]))) --end;
+                    nextStart = end;
+                    nextJoin = PIECE_FOLLOWS_DIRECTLY;
+                }
+            }
+            BookPiece piece;
+            piece.join = join;
+            piece.text = paragraph.substr(start, end - start);
+            pieces.push_back(std::move(piece));
+            join = nextJoin;
+            start = nextStart;
+        }
+    }
+
+    // The pieces of a book text put on pages of about BOOK_PAGE_BYTES
+    std::vector<std::vector<BookPiece>> ReadBookPages(std::string_view raw) {
+        std::vector<BookPiece> pieces;
+        for (const auto& paragraph : ReadParagraphs(raw)) AddPieces(paragraph, pieces);
+        std::vector<std::vector<BookPiece>> pages;
+        std::size_t pageBytes = 0;
+        for (auto& piece : pieces) {
+            if (pages.empty() || (pageBytes > 0 && pageBytes + piece.text.size() > BOOK_PAGE_BYTES)) {
+                pages.emplace_back();
+                pageBytes = 0;
+            }
+            pageBytes += piece.text.size();
+            pages.back().push_back(std::move(piece));
+        }
+        return pages;
+    }
+
     void OnMessage(SKSE::MessagingInterface::Message* message) {
         if (!message) return;
         // What was said before a save is loaded or a new game starts belongs to another game
         if (message->type == SKSE::MessagingInterface::kPreLoadGame || message->type == SKSE::MessagingInterface::kNewGame) {
             ForgetHeardLines();
+            ForgetEvents();
+        }
+        // Loading is over, or the new game runs: from a moment later on events are kept again
+        if (message->type == SKSE::MessagingInterface::kPostLoadGame || message->type == SKSE::MessagingInterface::kNewGame) {
+            AllowEventsSoon();
+        }
+        if (message->type == SKSE::MessagingInterface::kDataLoaded) {
+            InstallEventListeners();
         }
     }
 
@@ -2142,6 +2861,134 @@ namespace Companion {
     // so that a companion does not have to open every body to find out that it is empty. -1 = cannot tell
     std::int32_t GetLootCount(RE::StaticFunctionTag*, RE::TESObjectREFR* holder) { return CountLoot(holder); }
 
+    // The five functions below exist from interface version 17 on
+
+    // Called by the script about once a second, with the companion of the moment (None = there is none): keeps
+    // what has no event of the game (the player begins or stops sneaking or fighting), and ends the hits and the
+    // things taken that are counted together (see "events" above)
+    void TickEvents(RE::StaticFunctionTag*, RE::Actor* companion) {
+        eventCompanionID.store(companion ? companion->GetFormID() : 0);
+        EndRuns(false);
+        const auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return;
+        const bool isSneaking = player->IsSneaking();
+        const bool isFighting = player->IsInCombat();
+        std::string sneakText;
+        std::string fightText;
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            if (hasPlayerSample) {
+                if (isSneaking != wasPlayerSneaking) sneakText = isSneaking ? "The player started sneaking." : "The player stopped sneaking.";
+                if (isFighting != wasPlayerFighting) fightText = isFighting ? "The player is in a fight now." : "The fight of the player is over.";
+            }
+            hasPlayerSample = true;
+            wasPlayerSneaking = isSneaking;
+            wasPlayerFighting = isFighting;
+        }
+        if (!sneakText.empty()) KeepEvent(sneakText, false, 0);
+        if (!fightText.empty()) KeepEvent(fightText, isFighting, SAME_FIGHT_SECONDS);
+    }
+
+    // One text per event, its parts separated by tabs: how many seconds ago, the time of day in the game in minutes
+    // since midnight, urgent (1 or 0), what happened
+    std::vector<std::string> GetEventLines(const std::deque<GameEvent>& events) {
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<std::string> lines;
+        for (const auto& kept : events) {
+            const auto age = SecondsBetween(kept.time, now);
+            if (age > MAX_EVENT_AGE_SECONDS) continue;
+            std::string line = std::to_string(age);
+            line += FIELD_SEPARATOR;
+            line += std::to_string(kept.gameMinutes);
+            line += FIELD_SEPARATOR;
+            line += kept.isUrgent ? "1" : "0";
+            line += FIELD_SEPARATOR;
+            line += kept.text;
+            lines.push_back(std::move(line));
+        }
+        return lines;
+    }
+
+    // What happened since the last call, oldest first, at most maxLines (then the newest ones). The plugin forgets
+    // an event once it has handed it out. What is still being counted together is ended first, so that nothing is missing
+    std::vector<std::string> TakeEvents(RE::StaticFunctionTag*, std::int32_t maxLines) {
+        EndRuns(true);
+        const std::size_t limit = maxLines > 0 ? static_cast<std::size_t>(maxLines) : MAX_STORED_EVENTS;
+        std::deque<GameEvent> taken;
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            taken.swap(gameEvents);
+        }
+        while (taken.size() > limit) taken.pop_front();
+        return GetEventLines(taken);
+    }
+
+    // Only the urgent events since the last call (a fight begins, someone dies or goes down), built like the lines
+    // of TakeEvents. They are forgotten as well, the others stay for TakeEvents
+    std::vector<std::string> TakeUrgentEvents(RE::StaticFunctionTag*) {
+        std::deque<GameEvent> taken;
+        {
+            const std::lock_guard<std::mutex> guard(eventLock);
+            std::deque<GameEvent> others;
+            for (auto& kept : gameEvents) {
+                if (kept.isUrgent) {
+                    taken.push_back(std::move(kept));
+                } else {
+                    others.push_back(std::move(kept));
+                }
+            }
+            gameEvents.swap(others);
+        }
+        return GetEventLines(taken);
+    }
+
+    // The script moves things between the companion and the player itself (give, take). While this is set,
+    // things that change hands are no event
+    void SkipTransferEvents(RE::StaticFunctionTag*, bool isSkipping) { skipsTransfers.store(isSkipping); }
+
+    // The text of a book or a note, one page of it (from 1; too high = the last one). book is the book itself or a
+    // book that lies in the world. The first text tells about the book, its parts separated by tabs: the number of
+    // this page, how many pages there are (0 = the book has no text), the kind (0 = book, 1 = note, 2 = spell tome),
+    // the form ID of the book as eight hex digits, its title. Then one text per piece of the page: how it joins what
+    // came before (1 = it begins a paragraph, 0 = it goes on after a blank, 2 = it goes on right away), a tab, the text.
+    // Empty if this is no book. Reading it this way does nothing in the game: no skill goes up and no quest starts
+    std::vector<std::string> GetBookText(RE::StaticFunctionTag*, RE::TESForm* form, std::int32_t page) {
+        std::vector<std::string> lines;
+        if (!form) return lines;
+        if (auto* reference = form->AsReference()) form = reference->GetBaseObject();
+        auto* book = form ? form->As<RE::TESObjectBOOK>() : nullptr;
+        if (!book) return lines;
+        RE::BSString description;
+        book->GetDescription(description, book);
+        const auto pages = ReadBookPages(ViewOf(description.c_str()));
+        std::int32_t kind = BOOK_IS_BOOK;
+        if (book->TeachesSpell()) {
+            kind = BOOK_IS_SPELL_TOME;
+        } else if (book->IsNoteScroll()) {
+            kind = BOOK_IS_NOTE;
+        }
+        std::size_t pageNumber = page > 0 ? static_cast<std::size_t>(page) : 1;
+        if (pageNumber > pages.size()) pageNumber = pages.size();
+        std::string header = std::to_string(pageNumber);
+        header += FIELD_SEPARATOR;
+        header += std::to_string(pages.size());
+        header += FIELD_SEPARATOR;
+        header += std::to_string(kind);
+        header += FIELD_SEPARATOR;
+        header += std::format("{:08X}", book->GetFormID());
+        header += FIELD_SEPARATOR;
+        header += CleanText(ViewOf(book->GetName()));
+        lines.push_back(std::move(header));
+        if (pageNumber == 0) return lines;
+        for (const auto& piece : pages[pageNumber - 1]) {
+            std::string line = std::to_string(piece.join);
+            line += FIELD_SEPARATOR;
+            line += piece.text;
+            lines.push_back(std::move(line));
+        }
+        return lines;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -2167,6 +3014,11 @@ namespace Companion {
         vm->RegisterFunction("GetMount", SCRIPT_NAME, GetMount);
         vm->RegisterFunction("GetVisiblePlaces", SCRIPT_NAME, GetVisiblePlaces);
         vm->RegisterFunction("GetLootCount", SCRIPT_NAME, GetLootCount);
+        vm->RegisterFunction("TickEvents", SCRIPT_NAME, TickEvents);
+        vm->RegisterFunction("TakeEvents", SCRIPT_NAME, TakeEvents);
+        vm->RegisterFunction("TakeUrgentEvents", SCRIPT_NAME, TakeUrgentEvents);
+        vm->RegisterFunction("SkipTransferEvents", SCRIPT_NAME, SkipTransferEvents);
+        vm->RegisterFunction("GetBookText", SCRIPT_NAME, GetBookText);
         return true;
     }
 
