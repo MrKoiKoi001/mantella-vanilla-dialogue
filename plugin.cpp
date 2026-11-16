@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 25;
+    constexpr std::int32_t INTERFACE_VERSION = 26;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -4274,6 +4274,13 @@ namespace Companion {
     // ('visible' with the companion as the viewer), and how many degrees to the left and right the viewer sees
     constexpr std::size_t STATE_OPTION_VISIBLE = 32;
     constexpr std::size_t STATE_OPTION_VISIBLE_HALF_ANGLE = 33;
+    // From interface version 26 on, and not needed for a state: which of the facts the script used to ask the game
+    // for the plugin is to fill in itself (STATE_FACT_...). The script lets it, and checks now and then by asking
+    // the game as before: what the plugin worked out always goes back in the first numbers (STATE_HEAD_PLAYER_HEALTH ...)
+    constexpr std::size_t STATE_OPTION_PLUGIN_FACTS = 34;
+    constexpr std::int32_t STATE_FACT_HEALTH = 1;
+    constexpr std::int32_t STATE_FACT_SITTING = 2;
+    constexpr std::int32_t STATE_FACT_RUNNING = 4;
 
     // What the companion walks to, what it rides to, what it looks at, whom it follows on foot and on horseback,
     // and the three quests of the game mod that keep the horses
@@ -4294,7 +4301,20 @@ namespace Companion {
     constexpr std::size_t STATE_HEAD_COMPANION_RIDES = 2;
     constexpr std::size_t STATE_HEAD_PLAYER_HORSE_NAME_LOST = 3;
     constexpr std::size_t STATE_HEAD_OWN_HORSE_NAME_LOST = 4;
-    constexpr std::size_t STATE_HEAD_COUNT = 5;
+    // What the plugin worked out itself, for the script to check against what the game tells it
+    constexpr std::size_t STATE_HEAD_PLAYER_HEALTH = 5;
+    constexpr std::size_t STATE_HEAD_PLAYER_SIT_STATE = 6;
+    constexpr std::size_t STATE_HEAD_PLAYER_SLEEP_STATE = 7;
+    constexpr std::size_t STATE_HEAD_COMPANION_HEALTH = 8;
+    constexpr std::size_t STATE_HEAD_COMPANION_SIT_STATE = 9;
+    constexpr std::size_t STATE_HEAD_COMPANION_RUNS = 10;
+    constexpr std::size_t STATE_HEAD_COUNT = 11;
+    // Sitting and sleeping as scripts are told them: not, about to, doing it, about to stop
+    constexpr std::int32_t REST_STATE_NONE = 0;
+    constexpr std::int32_t REST_STATE_WANTED = 2;
+    constexpr std::int32_t REST_STATE_DOING = 3;
+    constexpr std::int32_t REST_STATE_ENDING = 4;
+    constexpr float PERCENT_FULL = 100.0f;
 
     // The lists of numbers. The times come first: the script writes how long it took itself into the first of them
     constexpr std::int32_t STATE_BLOCK_TIMES = 1;
@@ -4417,6 +4437,54 @@ namespace Companion {
         return CleanText(isNameLost ? keptName : shownName);
     }
 
+    // Health in percent of what the character has for good, rounded like the script rounds it. In a test the script
+    // told 109 percent for a companion with more health than usual for a while, so what is added for a while does
+    // not count as full health there either
+    std::int32_t GetHealthPercentOf(RE::Actor* actor) {
+        const auto* values = actor->AsActorValueOwner();
+        if (!values) return 0;
+        const float full = values->GetPermanentActorValue(RE::ActorValue::kHealth);
+        if (full <= 0.0f) return 0;
+        return static_cast<std::int32_t>(values->GetActorValue(RE::ActorValue::kHealth) / full * PERCENT_FULL + 0.5f);
+    }
+
+    std::int32_t GetSitStateOf(RE::Actor* actor) {
+        const auto* state = actor->AsActorState();
+        if (!state) return REST_STATE_NONE;
+        switch (state->GetSitSleepState()) {
+            case RE::SIT_SLEEP_STATE::kWantToSit:
+            case RE::SIT_SLEEP_STATE::kWaitingForSitAnim:
+                return REST_STATE_WANTED;
+            case RE::SIT_SLEEP_STATE::kIsSitting:
+                return REST_STATE_DOING;
+            case RE::SIT_SLEEP_STATE::kWantToStand:
+                return REST_STATE_ENDING;
+            default:
+                return REST_STATE_NONE;
+        }
+    }
+
+    std::int32_t GetSleepStateOf(RE::Actor* actor) {
+        const auto* state = actor->AsActorState();
+        if (!state) return REST_STATE_NONE;
+        switch (state->GetSitSleepState()) {
+            case RE::SIT_SLEEP_STATE::kWantToSleep:
+            case RE::SIT_SLEEP_STATE::kWaitingForSleepAnim:
+                return REST_STATE_WANTED;
+            case RE::SIT_SLEEP_STATE::kIsSleeping:
+                return REST_STATE_DOING;
+            case RE::SIT_SLEEP_STATE::kWantToWake:
+                return REST_STATE_ENDING;
+            default:
+                return REST_STATE_NONE;
+        }
+    }
+
+    std::int32_t GetRunsOf(RE::Actor* actor) {
+        const auto* state = actor->AsActorState();
+        return state && (state->IsRunning() || state->IsSprinting()) ? 1 : 0;
+    }
+
     // See the comment above. An empty list means: this state cannot be built here, the script builds it the old way
     std::vector<std::int32_t> GetWholeState(RE::StaticFunctionTag*, RE::Actor* player, RE::Actor* companion, RE::Actor* viewer,
                                             std::vector<RE::TESForm*> ownForms, std::vector<std::int32_t> options,
@@ -4453,6 +4521,19 @@ namespace Companion {
 
         numbers.assign(STATE_HEAD_COUNT, 0);
         numbers[STATE_HEAD_LENGTH] = static_cast<std::int32_t>(STATE_HEAD_COUNT);
+        // What the script used to ask the game: worked out here, told to the script, and used where the script says so
+        const std::int32_t pluginFacts = OptionOf(options, STATE_OPTION_PLUGIN_FACTS);
+        numbers[STATE_HEAD_PLAYER_HEALTH] = GetHealthPercentOf(player);
+        numbers[STATE_HEAD_PLAYER_SIT_STATE] = GetSitStateOf(player);
+        numbers[STATE_HEAD_PLAYER_SLEEP_STATE] = GetSleepStateOf(player);
+        if (companion) {
+            numbers[STATE_HEAD_COMPANION_HEALTH] = GetHealthPercentOf(companion);
+            numbers[STATE_HEAD_COMPANION_SIT_STATE] = GetSitStateOf(companion);
+            numbers[STATE_HEAD_COMPANION_RUNS] = GetRunsOf(companion);
+        }
+        const bool isHealthOwn = (pluginFacts & STATE_FACT_HEALTH) != 0;
+        const bool isSittingOwn = (pluginFacts & STATE_FACT_SITTING) != 0;
+        const bool isRunningOwn = (pluginFacts & STATE_FACT_RUNNING) != 0;
         // The script fills in the first of the two times in milliseconds. The second is how long this function took,
         // in tenths of a millisecond (see MICROSECONDS_PER_TIME_STEP)
         AddStateBlock(numbers, STATE_BLOCK_TIMES, {0, 0});
@@ -4464,7 +4545,7 @@ namespace Companion {
         const std::vector<std::int32_t> playerNumbers = GetActorNumbers(nullptr, player, nullptr);
         const auto* playerCell = player->GetParentCell();
         std::vector<std::int32_t> playerValues(STATE_PLAYER_VALUE_COUNT, 0);
-        playerValues[0] = OptionOf(options, STATE_OPTION_PLAYER_HEALTH);
+        playerValues[0] = isHealthOwn ? numbers[STATE_HEAD_PLAYER_HEALTH] : OptionOf(options, STATE_OPTION_PLAYER_HEALTH);
         playerValues[1] = playerNumbers[2];
         playerValues[2] = playerNumbers[3];
         playerValues[3] = playerNumbers[4];
@@ -4472,8 +4553,8 @@ namespace Companion {
         playerValues[5] = playerNumbers[6];
         playerValues[6] = playerCell && playerCell->IsInteriorCell() ? 1 : 0;
         playerValues[7] = playerNumbers[7];
-        playerValues[8] = OptionOf(options, STATE_OPTION_PLAYER_SIT_STATE);
-        playerValues[9] = OptionOf(options, STATE_OPTION_PLAYER_SLEEP_STATE);
+        playerValues[8] = isSittingOwn ? numbers[STATE_HEAD_PLAYER_SIT_STATE] : OptionOf(options, STATE_OPTION_PLAYER_SIT_STATE);
+        playerValues[9] = isSittingOwn ? numbers[STATE_HEAD_PLAYER_SLEEP_STATE] : OptionOf(options, STATE_OPTION_PLAYER_SLEEP_STATE);
         playerValues[10] = playerNumbers[8];
         AddStateBlock(numbers, STATE_BLOCK_PLAYER, playerValues);
         numbers[STATE_HEAD_PLAYER_RIDES] = playerNumbers[14];
@@ -4518,7 +4599,7 @@ namespace Companion {
             const std::vector<std::int32_t> companionNumbers = GetActorNumbers(nullptr, companion, player);
             std::vector<std::int32_t> companionValues(STATE_COMPANION_VALUE_COUNT, 0);
             companionValues[0] = companionNumbers[0];
-            companionValues[1] = OptionOf(options, STATE_OPTION_COMPANION_HEALTH);
+            companionValues[1] = isHealthOwn ? numbers[STATE_HEAD_COMPANION_HEALTH] : OptionOf(options, STATE_OPTION_COMPANION_HEALTH);
             companionValues[2] = companionNumbers[1];
             companionValues[3] = companionNumbers[2];
             const bool isHeldOnHorse = OptionOf(options, STATE_OPTION_RIDE_HOLD) != 0 && isRideWanted;
@@ -4537,7 +4618,7 @@ namespace Companion {
             } else if (isRideWanted) {
                 companionValues[11] = IdOf(FormOf(ownForms, STATE_FORM_RIDE_TARGET));
             }
-            companionValues[12] = OptionOf(options, STATE_OPTION_COMPANION_SIT_STATE);
+            companionValues[12] = isSittingOwn ? numbers[STATE_HEAD_COMPANION_SIT_STATE] : OptionOf(options, STATE_OPTION_COMPANION_SIT_STATE);
             companionValues[13] = companionNumbers[7];
             companionValues[14] = IdOf(FormOf(ownForms, STATE_FORM_LOOK_TARGET));
             if (const auto* leader = FormOf(ownForms, STATE_FORM_LEADER)) {
@@ -4546,7 +4627,7 @@ namespace Companion {
                 companionValues[15] = IdOf(FormOf(ownForms, STATE_FORM_RIDE_LEADER));
             }
             companionValues[16] = OptionOf(options, STATE_OPTION_KEEPS_WEAPON_AWAY);
-            companionValues[17] = OptionOf(options, STATE_OPTION_COMPANION_RUNS);
+            companionValues[17] = isRunningOwn ? numbers[STATE_HEAD_COMPANION_RUNS] : OptionOf(options, STATE_OPTION_COMPANION_RUNS);
             companionValues[18] = companionNumbers[8];
             companionValues[19] = OptionOf(options, STATE_OPTION_SNEAK_MODE);
             companionValues[20] = OptionOf(options, STATE_OPTION_AUTO_HEAL_PERCENT);
