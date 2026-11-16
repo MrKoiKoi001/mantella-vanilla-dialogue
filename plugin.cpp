@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 26;
+    constexpr std::int32_t INTERFACE_VERSION = 27;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -4698,6 +4698,239 @@ namespace Companion {
         return wholeStateTexts;
     }
 
+    // ------------------------------------------------------------------ cover
+    // cover: a spot near the companion that none of its enemies can see. The spots that are tried lie on rings around
+    // the companion. Each is pulled onto the navmesh of the game first: the ground the game lets characters walk on.
+    // So a spot on a roof, inside a rock or behind the wall of the next room is not taken. Whether the enemies see a
+    // spot is told by rays, from the eyes of each enemy to two heights of a body standing there.
+    // The navmesh is asked on the main thread of the game (see RequestCover): nothing here could tell whether those
+    // functions of the game may be called from the thread of a script, and the game itself asks them from its own threads.
+    // The game has a search for cover of its own (CombatCoverSearch), but only its name is known, so it is not used
+
+    // RE::Pathing::GetSingleton, RE::Pathing::GetPathingCell and RE::Pathing::FindClosestPointOnNavmesh, by their IDs
+    // for Skyrim SE (see HasGameAddress)
+    constexpr std::uint64_t PATHING_SINGLETON_ID = 514893;
+    constexpr std::uint64_t PATHING_CELL_ID = 29866;
+    constexpr std::uint64_t NAVMESH_CLOSEST_POINT_ID = 29832;
+    // Who counts as an enemy to hide from: hostile characters within this distance, the nearest ones
+    constexpr float COVER_ENEMY_RADIUS_UNITS = 60.0f * GAME_UNITS_PER_METER;
+    constexpr std::size_t COVER_MAX_ENEMIES = 8;
+    // The rings: the first one this far out, the next ones this much further each, with this many spots on a ring
+    constexpr float COVER_FIRST_RING_UNITS = 2.0f * GAME_UNITS_PER_METER;
+    constexpr float COVER_RING_STEP_UNITS = 1.5f * GAME_UNITS_PER_METER;
+    constexpr std::int32_t COVER_DIRECTIONS = 16;
+    constexpr float COVER_FULL_TURN = 2.0f * std::numbers::pi_v<float>;
+    // A spot counts as walkable if the navmesh is no further from it than this to the side, and if it lies no more
+    // than this much higher or lower than the companion (another floor is another place)
+    constexpr float COVER_SNAP_UNITS = 1.5f * GAME_UNITS_PER_METER;
+    constexpr float COVER_HEIGHT_UNITS = 4.0f * GAME_UNITS_PER_METER;
+    // The two heights of the body an enemy must not see, and how close to the body a ray may end and still count as
+    // stopped by something in between
+    constexpr std::array<float, 2> COVER_BODY_HEIGHTS = {50.0f, 120.0f};
+    constexpr float COVER_BODY_UNITS = 20.0f;
+    // Losing more health than this between two looks counts as being hit
+    constexpr float COVER_HIT_HEALTH = 1.0f;
+    // What TakeCoverResult tells first: a spot was found, the companion is covered where it stands, there is no
+    // such spot, there is no enemy, or the plugin cannot look. Then x, y and z of the spot and how many enemies
+    constexpr float COVER_RESULT_FOUND = 1.0f;
+    constexpr float COVER_RESULT_HERE = 2.0f;
+    constexpr float COVER_RESULT_NONE = 0.0f;
+    constexpr float COVER_RESULT_NO_ENEMY = -1.0f;
+    constexpr float COVER_RESULT_CANNOT = -2.0f;
+    constexpr std::size_t COVER_PLACE_OF_RESULT = 0;
+    constexpr std::size_t COVER_PLACE_OF_ENEMIES = 4;
+    constexpr float NOT_COVERED = -1.0f;
+
+    struct CoverEnemy {
+        RE::NiPoint3 feet;
+        RE::NiPoint3 eyes;
+        float distanceUnits = 0.0f;
+        std::string name;
+    };
+
+    // Whether something solid of the world stands between these eyes and the whole body of someone standing at "feet".
+    // Only call this while the physics are locked for reading
+    bool IsCoveredFrom(RE::bhkWorld* physics, float scale, const RE::NiPoint3& eyes, const RE::NiPoint3& feet) {
+        for (const float height : COVER_BODY_HEIGHTS) {
+            const RE::NiPoint3 point(feet.x, feet.y, feet.z + height);
+            const float length = (point - eyes).Length();
+            const RayHit hit = CastRay(physics, scale, eyes, point);
+            if (!hit.isHit || hit.distance >= length - COVER_BODY_UNITS) return false;
+        }
+        return true;
+    }
+
+    // The enemies around the companion that live and are there, the nearest first
+    std::vector<CoverEnemy> CollectCoverEnemies(RE::Actor* companion) {
+        std::vector<CoverEnemy> enemies;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !HasGameAddress(HOSTILE_TO_ACTOR_ID)) return enemies;
+        const RE::NiPoint3 own = companion->GetPosition();
+        ForEachReferenceAround(companion, COVER_ENEMY_RADIUS_UNITS, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference == companion || reference == player || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            auto* actor = reference->As<RE::Actor>();
+            if (!actor || !actor->Is3DLoaded() || actor->IsDead() || actor->IsPlayerTeammate()) return RE::BSContainer::ForEachResult::kContinue;
+            if (!actor->IsHostileToActor(player) && !actor->IsHostileToActor(companion)) return RE::BSContainer::ForEachResult::kContinue;
+            CoverEnemy enemy;
+            enemy.feet = actor->GetPosition();
+            enemy.eyes = RE::NiPoint3(enemy.feet.x, enemy.feet.y, enemy.feet.z + SIGHT_EYE_UNITS);
+            enemy.distanceUnits = own.GetDistance(enemy.feet);
+            enemy.name = CleanText(ViewOf(actor->GetDisplayFullName()));
+            enemies.push_back(std::move(enemy));
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        std::sort(enemies.begin(), enemies.end(), [](const CoverEnemy& left, const CoverEnemy& right) { return left.distanceUnits < right.distanceUnits; });
+        if (enemies.size() > COVER_MAX_ENEMIES) enemies.resize(COVER_MAX_ENEMIES);
+        return enemies;
+    }
+
+    // The point of the navmesh that is closest to a spot, if the game has a navmesh there
+    bool SnapToNavmesh(RE::Pathing* pathing, RE::TESObjectCELL* cell, RE::TESWorldSpace* world, const RE::NiPoint3& spot, RE::NiPoint3& snapped) {
+        RE::BSTSmartPointer<RE::BSPathingCell> pathingCell;
+        if (!pathing->GetPathingCell(spot, cell, world, pathingCell) || !pathingCell) return false;
+        return pathing->FindClosestPointOnNavmesh(pathingCell, spot, snapped);
+    }
+
+    // Looks for cover within radiusUnits around the companion, at least enemyUnits away from every enemy.
+    // mustMove: the spot the companion stands on does not count, and neither does one right next to it.
+    // Returns what TakeCoverResult hands on (see COVER_RESULT_...). Only call this on the main thread
+    std::vector<float> FindCover(RE::Actor* companion, float radiusUnits, float enemyUnits, bool mustMove) {
+        std::vector<float> result = {COVER_RESULT_CANNOT, 0.0f, 0.0f, 0.0f, 0.0f};
+        if (!companion || companion->IsDead() || !companion->Is3DLoaded()) return result;
+        if (!HasGameAddress(CELL_PHYSICS_ID) || !HasGameAddress(PHYSICS_LOCK_ID) || !HasGameAddress(PHYSICS_UNLOCK_ID)) return result;
+        if (!HasGameAddress(PATHING_SINGLETON_ID) || !HasGameAddress(PATHING_CELL_ID) || !HasGameAddress(NAVMESH_CLOSEST_POINT_ID)) return result;
+        auto* cell = companion->GetParentCell();
+        auto* physics = cell ? cell->GetbhkWorld() : nullptr;
+        auto* pathing = RE::Pathing::GetSingleton();
+        if (!physics || !pathing) return result;
+
+        const std::vector<CoverEnemy> enemies = CollectCoverEnemies(companion);
+        result[COVER_PLACE_OF_ENEMIES] = static_cast<float>(enemies.size());
+        if (enemies.empty()) {
+            result[COVER_PLACE_OF_RESULT] = COVER_RESULT_NO_ENEMY;
+            return result;
+        }
+        auto* world = cell->IsExteriorCell() ? cell->GetRuntimeData().worldSpace : nullptr;
+        const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+        const RE::NiPoint3 own = companion->GetPosition();
+        const float enemyCount = static_cast<float>(enemies.size());
+
+        const RE::BSReadLockGuard guard(physics->worldLock);
+        // How far the nearest enemy is from a spot that is cover from all of them, or NOT_COVERED
+        const auto rate = [&](const RE::NiPoint3& feet) {
+            float nearest = COVER_ENEMY_RADIUS_UNITS * 2.0f;
+            for (const CoverEnemy& enemy : enemies) {
+                const float apart = enemy.feet.GetDistance(feet);
+                if (apart < enemyUnits) return NOT_COVERED;
+                if (!IsCoveredFrom(physics, scale, enemy.eyes, feet)) return NOT_COVERED;
+                nearest = std::min(nearest, apart);
+            }
+            return nearest;
+        };
+        if (!mustMove && rate(own) > NOT_COVERED) {
+            result = {COVER_RESULT_HERE, own.x, own.y, own.z, enemyCount};
+            return result;
+        }
+        // The nearest ring that has cover wins, and on it the spot furthest from the enemies
+        std::int32_t ringNumber = 0;
+        for (float ring = COVER_FIRST_RING_UNITS; ring <= radiusUnits; ring += COVER_RING_STEP_UNITS) {
+            float bestApart = NOT_COVERED;
+            RE::NiPoint3 best;
+            // Every other ring is turned by half a step, so that the spots do not lie on the same lines
+            const float turn = ringNumber % 2 == 0 ? 0.0f : 0.5f;
+            ++ringNumber;
+            for (std::int32_t direction = 0; direction < COVER_DIRECTIONS; ++direction) {
+                const float angle = (static_cast<float>(direction) + turn) * COVER_FULL_TURN / static_cast<float>(COVER_DIRECTIONS);
+                const RE::NiPoint3 spot(own.x + std::sin(angle) * ring, own.y + std::cos(angle) * ring, own.z);
+                RE::NiPoint3 snapped;
+                if (!SnapToNavmesh(pathing, cell, world, spot, snapped)) continue;
+                const float sideEast = snapped.x - spot.x;
+                const float sideNorth = snapped.y - spot.y;
+                if (std::sqrt(sideEast * sideEast + sideNorth * sideNorth) > COVER_SNAP_UNITS) continue;
+                if (std::abs(snapped.z - own.z) > COVER_HEIGHT_UNITS) continue;
+                const float apart = rate(snapped);
+                if (apart > bestApart) {
+                    bestApart = apart;
+                    best = snapped;
+                }
+            }
+            if (bestApart > NOT_COVERED) {
+                result = {COVER_RESULT_FOUND, best.x, best.y, best.z, enemyCount};
+                return result;
+            }
+        }
+        result[COVER_PLACE_OF_RESULT] = COVER_RESULT_NONE;
+        return result;
+    }
+
+    std::mutex coverLock;
+    std::vector<float> coverResult;
+    bool isCoverPending = false;
+    RE::FormID coverWatchedID = 0;
+    float coverLastHealth = 0.0f;
+
+    // Starts the search for cover (see FindCover). It runs a moment later, on the main thread of the game, and
+    // TakeCoverResult hands out what it found. Returns whether the search could be handed to the game
+    bool RequestCover(RE::StaticFunctionTag*, RE::Actor* companion, std::int32_t radiusMeters, std::int32_t enemyMeters, bool mustMove) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!companion || !tasks) return false;
+        {
+            const std::lock_guard<std::mutex> guard(coverLock);
+            coverResult.clear();
+            isCoverPending = true;
+        }
+        const auto handle = companion->GetHandle();
+        tasks->AddTask([handle, radiusMeters, enemyMeters, mustMove]() {
+            const auto seeker = handle.get();
+            std::vector<float> found = FindCover(seeker.get(), static_cast<float>(radiusMeters) * GAME_UNITS_PER_METER,
+                                                 static_cast<float>(enemyMeters) * GAME_UNITS_PER_METER, mustMove);
+            const std::lock_guard<std::mutex> guard(coverLock);
+            coverResult = std::move(found);
+            isCoverPending = false;
+        });
+        return true;
+    }
+
+    // What the search RequestCover started has found, or an empty list while it is still running
+    std::vector<float> TakeCoverResult(RE::StaticFunctionTag*) {
+        const std::lock_guard<std::mutex> guard(coverLock);
+        if (isCoverPending) return {};
+        return coverResult;
+    }
+
+    // Why the companion should leave the cover it stands in, as the start of a sentence, or an empty text if there is
+    // no reason: it has lost health since the last look, or an enemy that sees it has come closer than nearMeters.
+    // isFirst: the first look at this cover, so there is no health from before to compare with
+    std::string GetCoverThreat(RE::StaticFunctionTag*, RE::Actor* companion, std::int32_t nearMeters, bool isFirst) {
+        if (!companion || companion->IsDead() || !companion->Is3DLoaded()) return "";
+        const auto* values = companion->AsActorValueOwner();
+        const float health = values ? values->GetActorValue(RE::ActorValue::kHealth) : 0.0f;
+        bool wasHit = false;
+        {
+            const std::lock_guard<std::mutex> guard(coverLock);
+            wasHit = !isFirst && coverWatchedID == companion->GetFormID() && health < coverLastHealth - COVER_HIT_HEALTH;
+            coverWatchedID = companion->GetFormID();
+            coverLastHealth = health;
+        }
+        if (wasHit) return "you were hit";
+        if (!HasGameAddress(CELL_PHYSICS_ID) || !HasGameAddress(PHYSICS_LOCK_ID) || !HasGameAddress(PHYSICS_UNLOCK_ID)) return "";
+        const auto* cell = companion->GetParentCell();
+        auto* physics = cell ? cell->GetbhkWorld() : nullptr;
+        if (!physics) return "";
+        const std::vector<CoverEnemy> enemies = CollectCoverEnemies(companion);
+        const float nearUnits = static_cast<float>(nearMeters) * GAME_UNITS_PER_METER;
+        const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+        const RE::NiPoint3 own = companion->GetPosition();
+        const RE::BSReadLockGuard guard(physics->worldLock);
+        for (const CoverEnemy& enemy : enemies) {
+            if (enemy.distanceUnits > nearUnits) break;
+            if (!IsCoveredFrom(physics, scale, enemy.eyes, own)) return (enemy.name.empty() ? std::string("an enemy") : enemy.name) + " got too close";
+        }
+        return "";
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -4748,6 +4981,9 @@ namespace Companion {
         vm->RegisterFunction("GetLooseItemNumbers", SCRIPT_NAME, GetLooseItemNumbers);
         vm->RegisterFunction("GetWholeState", SCRIPT_NAME, GetWholeState);
         vm->RegisterFunction("GetWholeStateTexts", SCRIPT_NAME, GetWholeStateTexts);
+        vm->RegisterFunction("RequestCover", SCRIPT_NAME, RequestCover);
+        vm->RegisterFunction("TakeCoverResult", SCRIPT_NAME, TakeCoverResult);
+        vm->RegisterFunction("GetCoverThreat", SCRIPT_NAME, GetCoverThreat);
         return true;
     }
 
