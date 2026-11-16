@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 21;
+    constexpr std::int32_t INTERFACE_VERSION = 23;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -263,6 +263,8 @@ namespace Companion {
     // RE::InventoryEntryData::GetValue (what an item is worth) and the settings of the game, for trading
     constexpr std::uint64_t ITEM_VALUE_ID = 15757;
     constexpr std::uint64_t GAME_SETTINGS_ID = 514622;
+    // RE::TESObjectREFR::IsCrimeToActivate, for what a companion must not collect (see FindLooseItems)
+    constexpr std::uint64_t CRIME_TO_ACTIVATE_ID = 19400;
     // The file name is these two parts around the version of the game, eg "1-4-15-0"
     constexpr std::string_view ADDRESS_FILE_START = "Data/SKSE/Plugins/version-";
     constexpr std::string_view ADDRESS_FILE_END = ".csv";
@@ -619,6 +621,33 @@ namespace Companion {
             world = world->parentWorld;
         }
         return world;
+    }
+
+    // Why a character or a thing is not really there for the viewer, as the end of a sentence, or an empty text if it
+    // is there. The game keeps characters it does not show: disabled ones, ones without a body, ones whose body it
+    // hides. In a test a character nobody could see stood in the list of the characters around, and the companion
+    // was sent to it. For a thing only "disabled" and "being deleted" count: a map marker never has a body
+    std::string GetAbsence(RE::TESObjectREFR* reference, const RE::TESObjectREFR* viewer) {
+        if (!reference) return "does not exist";
+        if (reference->IsDisabled()) return "is disabled: the game has taken it out of the world";
+        if (reference->IsMarkedForDeletion()) return "is being deleted by the game";
+        auto* actor = reference->As<RE::Actor>();
+        if (!actor) return "";
+        if (!actor->Is3DLoaded()) return "has no body in the world right now";
+        const auto* body = actor->Get3D();
+        if (body && body->GetAppCulled()) return "is hidden: the game does not draw it";
+        const auto* cell = actor->GetParentCell();
+        if (!cell) return "is in no place of the world right now";
+        if (!cell->IsAttached()) return "is in a place the game has not loaded";
+        const auto* viewerCell = viewer ? viewer->GetParentCell() : nullptr;
+        if (viewerCell && viewerCell != cell) {
+            if (viewerCell->IsInteriorCell() || cell->IsInteriorCell()) return "is in another place than the player";
+            if (GetRootWorldOf(viewerCell) != GetRootWorldOf(cell)) return "is in another part of the world than the player";
+        }
+        if (const auto* values = actor->AsActorValueOwner()) {
+            if (values->GetActorValue(RE::ActorValue::kInvisibility) > 0.0f) return "is invisible";
+        }
+        return "";
     }
 
     // Only then a distance and a direction between two positions mean anything
@@ -2058,8 +2087,46 @@ namespace Companion {
         }
     }
 
+    // Which menus were open, for the log of the companion server: a game that stands still in a menu asks the server
+    // nothing, and afterwards nobody could tell why it was silent. The script fetches the lines with its next request
+    // (TakeMenuLines). What the game shows all the time or with every other menu is left out
+    constexpr std::array<std::string_view, 8> LASTING_MENU_NAMES = {"HUD Menu",  "Cursor Menu",        "Fader Menu",   "LoadWaitSpinner",
+                                                                    "Mist Menu", "WSActivateRollover", "SafeZoneMenu", "Kinect Menu"};
+    constexpr std::size_t MAX_KEPT_MENUS = 20;
+
+    struct MenuVisit {
+        std::string name;
+        std::int64_t milliseconds = 0;
+    };
+
+    std::mutex menuLock;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> openMenus;
+    std::deque<MenuVisit> menuVisits;
+
+    // Remembers when a menu opens, and how long it was open once it closes
+    void NoteMenu(std::string_view menuName, bool isOpening) {
+        if (menuName.empty()) return;
+        if (std::find(LASTING_MENU_NAMES.begin(), LASTING_MENU_NAMES.end(), menuName) != LASTING_MENU_NAMES.end()) return;
+        const auto now = std::chrono::steady_clock::now();
+        const std::string name(menuName);
+        const std::lock_guard<std::mutex> guard(menuLock);
+        if (isOpening) {
+            openMenus.try_emplace(name, now);
+            return;
+        }
+        const auto opened = openMenus.find(name);
+        if (opened == openMenus.end()) return;
+        MenuVisit visit;
+        visit.name = name;
+        visit.milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now - opened->second).count();
+        openMenus.erase(opened);
+        menuVisits.push_back(std::move(visit));
+        while (menuVisits.size() > MAX_KEPT_MENUS) menuVisits.pop_front();
+    }
+
     void OnMenuEvent(const RE::MenuOpenCloseEvent& event) {
         const auto menuName = ViewOf(event.menuName.c_str());
+        NoteMenu(menuName, event.opening);
         if (menuName == LOCKPICKING_MENU_NAME) {
             if (event.opening) KeepEvent("The player started picking a lock.");
             return;
@@ -2907,6 +2974,8 @@ namespace Companion {
             auto* actor = reference->As<RE::Actor>();
             // A character without a body is not in the world right now (eg it waits to be placed)
             if (!actor || !actor->Is3DLoaded()) return RE::BSContainer::ForEachResult::kContinue;
+            // Nor is one the game hides or keeps somewhere else (see GetAbsence)
+            if (!GetAbsence(actor, viewer).empty()) return RE::BSContainer::ForEachResult::kContinue;
             SeenCharacter character;
             character.actor = actor;
             character.distance = own.GetDistance(actor->GetPosition());
@@ -3690,7 +3759,7 @@ namespace Companion {
     // AI took about six seconds that way, most of it for the characters around: several questions per character.
     // These functions answer many of those questions in one go
 
-    constexpr std::size_t ACTOR_NUMBER_COUNT = 14;
+    constexpr std::size_t ACTOR_NUMBER_COUNT = 16;
     constexpr std::int32_t NEARBY_NOT_KNOWN = -1;
     constexpr std::int32_t NEARBY_RANK_FOUGHT = 0;
     constexpr std::int32_t NEARBY_RANK_HOSTILE = 1;
@@ -3704,7 +3773,8 @@ namespace Companion {
     // What a script would ask a character one by one. viewer: from whom the distance and the direction count (None =
     // both stay 0). The numbers: ref ID, dead, in a fight, position x, y, z, the direction it faces in degrees, weapon
     // drawn, sneaking, in the loaded area, distance to the viewer in meters, angle from where the viewer faces in
-    // degrees (negative = left), ref ID of whom it fights (0 = nobody), told to wait by the player
+    // degrees (negative = left), ref ID of whom it fights (0 = nobody), told to wait by the player, and from interface
+    // version 23 on: rides, sits on something (seated or about to get up; a rider counts as seated too)
     std::vector<std::int32_t> GetActorNumbers(RE::StaticFunctionTag*, RE::Actor* actor, RE::Actor* viewer) {
         std::vector<std::int32_t> numbers(ACTOR_NUMBER_COUNT, 0);
         if (!actor) return numbers;
@@ -3728,6 +3798,11 @@ namespace Companion {
         const auto fought = actor->GetActorRuntimeData().currentCombatTarget.get();
         if (fought) numbers[12] = static_cast<std::int32_t>(fought->GetFormID());
         if (const auto* values = actor->AsActorValueOwner()) numbers[13] = values->GetActorValue(RE::ActorValue::kWaitingForPlayer) > 0.0f ? 1 : 0;
+        numbers[14] = actor->IsOnMount() ? 1 : 0;
+        if (state) {
+            const auto sitState = state->GetSitSleepState();
+            numbers[15] = sitState == RE::SIT_SLEEP_STATE::kIsSitting || sitState == RE::SIT_SLEEP_STATE::kWantToStand ? 1 : 0;
+        }
         return numbers;
     }
 
@@ -3764,8 +3839,8 @@ namespace Companion {
                     return RE::BSContainer::ForEachResult::kContinue;
                 }
                 auto* actor = reference->As<RE::Actor>();
-                // A character without a body is not in the world right now
-                if (!actor || !actor->Is3DLoaded()) return RE::BSContainer::ForEachResult::kContinue;
+                // A character without a body is not in the world right now, nor is one the game hides (see GetAbsence)
+                if (!actor || !actor->Is3DLoaded() || !GetAbsence(actor, viewer).empty()) return RE::BSContainer::ForEachResult::kContinue;
                 for (const auto& known : seen) {
                     if (known.actor == actor) return RE::BSContainer::ForEachResult::kContinue;
                 }
@@ -3819,6 +3894,189 @@ namespace Companion {
         return nearbyNames;
     }
 
+    // The function below exists from interface version 22 on
+
+    // Why the target of a command is not really there (see GetAbsence), or an empty text if it is. viewer: the player.
+    // What the plugin found goes into its log, so that a character nobody can see can be looked up afterwards
+    std::string GetAbsenceReason(RE::StaticFunctionTag*, RE::TESObjectREFR* target, RE::Actor* viewer) {
+        const std::string absence = GetAbsence(target, viewer);
+        if (target) {
+            const auto* actor = target->As<RE::Actor>();
+            const auto* cell = target->GetParentCell();
+            const auto* body = actor ? target->Get3D() : nullptr;
+            const auto position = target->GetPosition();
+            logger::info("Presence {:08X} {}: disabled={} deleted={} character={} body={} hidden={} cell={:08X} attached={} indoors={} world={:08X} position=({:.0f}, {:.0f}, {:.0f}) -> {}",
+                         target->GetFormID(), CleanText(ViewOf(target->GetDisplayFullName())), target->IsDisabled(), target->IsMarkedForDeletion(),
+                         actor != nullptr, target->Is3DLoaded(), body && body->GetAppCulled(), cell ? cell->GetFormID() : 0,
+                         cell && cell->IsAttached(), cell && cell->IsInteriorCell(), GetRootWorldOf(cell) ? GetRootWorldOf(cell)->GetFormID() : 0,
+                         position.x, position.y, position.z, absence.empty() ? "there" : absence);
+        }
+        return absence;
+    }
+
+    // The four functions below exist from interface version 23 on
+
+    // Which menus were opened and closed again since the last call, oldest first: the name the game gives the menu,
+    // a tab and how long it was open in milliseconds. The plugin forgets them once it has handed them out
+    std::vector<std::string> TakeMenuLines(RE::StaticFunctionTag*) {
+        std::deque<MenuVisit> taken;
+        {
+            const std::lock_guard<std::mutex> guard(menuLock);
+            taken.swap(menuVisits);
+        }
+        std::vector<std::string> lines;
+        lines.reserve(taken.size());
+        for (const auto& visit : taken) lines.push_back(std::format("{}\t{}", CleanText(visit.name), visit.milliseconds));
+        return lines;
+    }
+
+    // What a character holds in its hands, as the script built it before with several questions: "R:" and the name of
+    // what is in the right hand, "L:" and the name of what is in the left one (a shield counts as held in the left
+    // hand). A weapon held with both hands is only named for the right one. Nothing behind the colon = an empty hand
+    std::vector<std::string> GetHandNames(RE::StaticFunctionTag*, RE::Actor* holder) {
+        std::vector<std::string> hands = {"R:", "L:"};
+        if (!holder) return hands;
+        const RE::TESForm* rightHand = holder->GetEquippedObject(false);
+        const RE::TESForm* leftHand = holder->GetEquippedObject(true);
+        if (!leftHand) leftHand = holder->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kShield);
+        if (rightHand) hands[0] += rightHand->GetName();
+        if (leftHand && leftHand != rightHand) hands[1] += leftHand->GetName();
+        return hands;
+    }
+
+    // ------------------------------------------------------------ loose items to collect (pick_up with 'all')
+    // The words of the filter. The companion server and the script use the same ones
+    constexpr std::string_view LOOSE_KIND_POTIONS = "potions";
+    constexpr std::string_view LOOSE_KIND_FOOD = "food";
+    constexpr std::string_view LOOSE_KIND_INGREDIENTS = "ingredients";
+    constexpr std::string_view LOOSE_KIND_WEAPONS = "weapons";
+    constexpr std::string_view LOOSE_KIND_ARMOR = "armor";
+    constexpr std::string_view LOOSE_KIND_AMMO = "ammo";
+    constexpr std::string_view LOOSE_KIND_BOOKS = "books";
+    constexpr std::string_view LOOSE_KIND_SCROLLS = "scrolls";
+    constexpr std::string_view LOOSE_KIND_KEYS = "keys";
+    constexpr std::string_view LOOSE_KIND_GOLD = "gold";
+    constexpr std::string_view LOOSE_KIND_MISC = "misc";
+    constexpr std::string_view LOOSE_KIND_NONE = "";
+    constexpr std::string_view LOOSE_FILTER_NO_CLUTTER = "no_clutter";
+    // The keyword the game gives the odds and ends merchants pay next to nothing for: plates, tankards, quills
+    constexpr std::string_view CLUTTER_KEYWORD = "VendorItemClutter";
+    // What lies higher or lower than this, seen from the center, lies on another floor
+    constexpr float LOOSE_ITEM_HEIGHT_UNITS = 2.5f * GAME_UNITS_PER_METER;
+    constexpr std::int32_t LOOSE_NOT_KNOWN = -1;
+
+    std::mutex looseLock;
+    // What FindLooseItems left out the last time (see GetLooseItemNumbers)
+    std::int32_t looseOwnedCount = 0;
+    std::int32_t looseMoreCount = 0;
+
+    // Under which word of the filter something falls that lies around, or LOOSE_KIND_NONE if it is nothing to collect
+    std::string_view GetLooseKind(const RE::TESBoundObject* base) {
+        switch (base->GetFormType()) {
+            case RE::FormType::AlchemyItem: {
+                const auto* potion = base->As<RE::AlchemyItem>();
+                return potion && potion->IsFood() ? LOOSE_KIND_FOOD : LOOSE_KIND_POTIONS;
+            }
+            case RE::FormType::Ingredient:
+                return LOOSE_KIND_INGREDIENTS;
+            case RE::FormType::Weapon:
+                return LOOSE_KIND_WEAPONS;
+            case RE::FormType::Armor:
+                return LOOSE_KIND_ARMOR;
+            case RE::FormType::Ammo:
+                return LOOSE_KIND_AMMO;
+            case RE::FormType::Book:
+                return LOOSE_KIND_BOOKS;
+            case RE::FormType::Scroll:
+                return LOOSE_KIND_SCROLLS;
+            case RE::FormType::KeyMaster:
+                return LOOSE_KIND_KEYS;
+            case RE::FormType::SoulGem:
+                return LOOSE_KIND_MISC;
+            case RE::FormType::Misc:
+                return base->IsGold() ? LOOSE_KIND_GOLD : LOOSE_KIND_MISC;
+            case RE::FormType::Light: {
+                // A torch can be carried, a candle on the wall cannot
+                const auto* light = base->As<RE::TESObjectLIGH>();
+                return light && light->CanBeCarried() ? LOOSE_KIND_MISC : LOOSE_KIND_NONE;
+            }
+            default:
+                return LOOSE_KIND_NONE;
+        }
+    }
+
+    bool IsClutter(const RE::TESBoundObject* base) {
+        const auto* keywords = base->As<RE::BGSKeywordForm>();
+        return keywords && keywords->HasKeywordString(CLUTTER_KEYWORD);
+    }
+
+    // The loose items a companion may collect within radiusMeters around the center (nothing = around the companion),
+    // the ones nearest to the companion first, at most maxItems. filter: one of the words above (only that kind),
+    // LOOSE_FILTER_NO_CLUTTER (everything but what the game marks with CLUTTER_KEYWORD), or empty for everything.
+    // Left out: what belongs to someone (taking it would be stealing), what has no name, what is not meant for the
+    // player, lights that cannot be carried, arrows that were shot (they are no items for the game, see
+    // TakeRestingArrow) and what lies on another floor (see LOOSE_ITEM_HEIGHT_UNITS). GetLooseItemNumbers tells
+    // afterwards how much was left out
+    std::vector<RE::TESObjectREFR*> FindLooseItems(RE::StaticFunctionTag*, RE::Actor* companion, RE::TESObjectREFR* center,
+                                                   std::int32_t radiusMeters, RE::BSFixedString filter, std::int32_t maxItems) {
+        std::vector<RE::TESObjectREFR*> items;
+        std::int32_t ownedCount = 0;
+        std::int32_t moreCount = 0;
+        const bool canScan = companion && radiusMeters > 0 && maxItems > 0 && HasGameAddress(CRIME_TO_ACTIVATE_ID);
+        if (canScan) {
+            if (!center) center = companion;
+            const std::string wanted(ViewOf(filter.c_str()));
+            const auto middle = center->GetPosition();
+            const auto own = companion->GetPosition();
+            const float radius = static_cast<float>(radiusMeters) * GAME_UNITS_PER_METER;
+            const auto goOn = RE::BSContainer::ForEachResult::kContinue;
+            std::vector<std::pair<float, RE::TESObjectREFR*>> found;
+            ForEachReferenceAround(companion, radius + own.GetDistance(middle), [&](RE::TESObjectREFR* reference) {
+                if (!reference || reference == companion || reference->IsDisabled() || reference->IsMarkedForDeletion() || !reference->Is3DLoaded()) {
+                    return goOn;
+                }
+                const auto* base = reference->GetBaseObject();
+                if (!base || !base->GetPlayable()) return goOn;
+                const std::string_view kind = GetLooseKind(base);
+                if (kind.empty()) return goOn;
+                const auto position = reference->GetPosition();
+                if (position.GetDistance(middle) > radius || std::abs(position.z - middle.z) > LOOSE_ITEM_HEIGHT_UNITS) return goOn;
+                if (CleanText(ViewOf(reference->GetDisplayFullName())).empty()) return goOn;
+                if (wanted == LOOSE_FILTER_NO_CLUTTER) {
+                    if (IsClutter(base)) return goOn;
+                } else if (!wanted.empty() && wanted != kind) {
+                    return goOn;
+                }
+                if (reference->IsCrimeToActivate()) {
+                    ++ownedCount;
+                    return goOn;
+                }
+                found.emplace_back(own.GetDistance(position), reference);
+                return goOn;
+            });
+            std::sort(found.begin(), found.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+            const std::size_t limit = static_cast<std::size_t>(maxItems);
+            if (found.size() > limit) moreCount = static_cast<std::int32_t>(found.size() - limit);
+            for (const auto& entry : found) {
+                if (items.size() >= limit) break;
+                items.push_back(entry.second);
+            }
+        }
+        {
+            const std::lock_guard<std::mutex> guard(looseLock);
+            looseOwnedCount = canScan ? ownedCount : LOOSE_NOT_KNOWN;
+            looseMoreCount = moreCount;
+        }
+        return items;
+    }
+
+    // What the last FindLooseItems left out: how many things that belong to someone (LOOSE_NOT_KNOWN = it could not
+    // look at all), and how many more it found than it was allowed to return
+    std::vector<std::int32_t> GetLooseItemNumbers(RE::StaticFunctionTag*) {
+        const std::lock_guard<std::mutex> guard(looseLock);
+        return {looseOwnedCount, looseMoreCount};
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -3862,6 +4120,11 @@ namespace Companion {
         vm->RegisterFunction("GetActorNumbers", SCRIPT_NAME, GetActorNumbers);
         vm->RegisterFunction("GetNearbyValues", SCRIPT_NAME, GetNearbyValues);
         vm->RegisterFunction("GetNearbyNames", SCRIPT_NAME, GetNearbyNames);
+        vm->RegisterFunction("GetAbsenceReason", SCRIPT_NAME, GetAbsenceReason);
+        vm->RegisterFunction("TakeMenuLines", SCRIPT_NAME, TakeMenuLines);
+        vm->RegisterFunction("GetHandNames", SCRIPT_NAME, GetHandNames);
+        vm->RegisterFunction("FindLooseItems", SCRIPT_NAME, FindLooseItems);
+        vm->RegisterFunction("GetLooseItemNumbers", SCRIPT_NAME, GetLooseItemNumbers);
         return true;
     }
 
