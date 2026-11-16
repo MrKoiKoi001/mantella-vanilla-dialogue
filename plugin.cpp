@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 24;
+    constexpr std::int32_t INTERFACE_VERSION = 25;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -629,6 +629,9 @@ namespace Companion {
     // was sent to it. For a thing only "disabled" and "being deleted" count: a map marker never has a body
     std::string GetAbsence(RE::TESObjectREFR* reference, const RE::TESObjectREFR* viewer) {
         if (!reference) return "does not exist";
+        // The player is always there. Seen through its own eyes the game does not draw its body, which looked like
+        // a hidden character here and kept the companion from speaking to the player
+        if (reference->IsPlayerRef()) return "";
         if (reference->IsDisabled()) return "is disabled: the game has taken it out of the world";
         if (reference->IsMarkedForDeletion()) return "is being deleted by the game";
         auto* actor = reference->As<RE::Actor>();
@@ -1707,6 +1710,9 @@ namespace Companion {
     bool hasQuestSample = false;
     // The hostile characters the companion has spotted, with the time, and the traps (see SpotDangers)
     std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> spottedCharacters;
+    // The hostile characters the companion has heard or felt close by without seeing them, with the time and
+    // which of the two it was (SENSE_HEARD or SENSE_CLOSE)
+    std::unordered_map<RE::FormID, std::pair<std::chrono::steady_clock::time_point, std::int32_t>> sensedCharacters;
     std::unordered_set<RE::FormID> spottedTraps;
     bool hasSlowCheck = false;
     std::chrono::steady_clock::time_point lastSlowCheck;
@@ -2217,6 +2223,7 @@ namespace Companion {
         questSamples.clear();
         hasQuestSample = false;
         spottedCharacters.clear();
+        sensedCharacters.clear();
         spottedTraps.clear();
         hasSlowCheck = false;
     }
@@ -2339,9 +2346,54 @@ namespace Companion {
     // nothing solid stands in front of: a companion that tells of a trap behind a wall would know more than it can.
     // Each one becomes an urgent event, so the AI hears of it with the answer to its next command
 
+    // ------------------------------------------------------------ senses
+    // What a viewer notices of a character: it sees it (in front, with nothing solid in between), it has it close by
+    // (within CLOSE_UNITS all around, whatever is in between and however quiet the other is), or it hears it. How far
+    // a character can be heard goes by how loud it is, and behind something solid only half as far. The numbers are
+    // what the player asked for after a test in which an enemy could walk up to the companion from behind unnoticed
+    constexpr std::int32_t SENSE_NONE = 0;
+    constexpr std::int32_t SENSE_SEEN = 1;
+    constexpr std::int32_t SENSE_CLOSE = 2;
+    constexpr std::int32_t SENSE_HEARD = 3;
+    constexpr float CLOSE_UNITS = 2.0f * GAME_UNITS_PER_METER;
+    constexpr float HEAR_SNEAKING_UNITS = 3.0f * GAME_UNITS_PER_METER;
+    constexpr float HEAR_STILL_UNITS = 5.0f * GAME_UNITS_PER_METER;
+    constexpr float HEAR_WALKING_UNITS = 12.0f * GAME_UNITS_PER_METER;
+    // Running, fighting, with a weapon drawn or casting a spell
+    constexpr float HEAR_LOUD_UNITS = 30.0f * GAME_UNITS_PER_METER;
+    constexpr float HEAR_BEHIND_WALL_PART = 0.5f;
+
+    // How far away a living character can be heard at the moment, with nothing solid in between
+    float GetHearingUnits(RE::Actor* actor) {
+        if (actor->IsSneaking()) return HEAR_SNEAKING_UNITS;
+        const auto* state = actor->AsActorState();
+        const bool isMoving = actor->IsMoving();
+        const bool isArmed = state && state->IsWeaponDrawn();
+        const bool isFast = isMoving && state && (state->IsRunning() || state->IsSprinting());
+        if (actor->IsInCombat() || isArmed || isFast || actor->WhoIsCasting() != 0) return HEAR_LOUD_UNITS;
+        return isMoving ? HEAR_WALKING_UNITS : HEAR_STILL_UNITS;
+    }
+
+    // Which sense tells a viewer of a character, or SENSE_NONE if it notices nothing of it. view and distanceUnits:
+    // where the character is, seen from the viewer. halfAngleDegrees: how far to the left and right the viewer sees.
+    // The dead make no sound. Only call this while the physics are locked for reading
+    std::int32_t GetSenseOf(RE::bhkWorld* physics, float scale, const RE::NiPoint3& eyes, RE::Actor* actor, const View& view, float distanceUnits,
+                            std::int32_t halfAngleDegrees) {
+        const bool isInFront = std::abs(view.angleDegrees) <= halfAngleDegrees;
+        // Further away than anything can be heard, and not in front: no ray is needed to tell
+        if (!isInFront && distanceUnits > HEAR_LOUD_UNITS) return SENSE_NONE;
+        const bool isInSight = IsInSight(physics, scale, eyes, actor->GetPosition());
+        if (isInFront && isInSight) return SENSE_SEEN;
+        if (distanceUnits <= CLOSE_UNITS) return SENSE_CLOSE;
+        if (actor->IsDead()) return SENSE_NONE;
+        const float reach = GetHearingUnits(actor) * (isInSight ? 1.0f : HEAR_BEHIND_WALL_PART);
+        return distanceUnits <= reach ? SENSE_HEARD : SENSE_NONE;
+    }
+
     constexpr float SPOT_RADIUS_UNITS = 40.0f * GAME_UNITS_PER_METER;
     constexpr std::int32_t SPOT_HALF_ANGLE_DEGREES = 95;
     constexpr std::int32_t SPOT_AHEAD_DEGREES = 25;
+    constexpr std::int32_t SPOT_BEHIND_DEGREES = 135;
     constexpr std::int64_t SPOT_AGAIN_SECONDS = 120;
     constexpr std::size_t MAX_NAMED_SPOTS = 3;
     constexpr std::size_t MAX_REMEMBERED_SPOTS = 300;
@@ -2351,6 +2403,10 @@ namespace Companion {
         RE::NiPoint3 position;
         View view;
         std::string name;
+        // For characters: who it is, how far away in game units, and which sense tells of it (see SENSE_...)
+        RE::Actor* actor = nullptr;
+        float distanceUnits = 0.0f;
+        std::int32_t sense = SENSE_NONE;
     };
 
     // "25 m ahead of you", "8 m to your left"
@@ -2364,6 +2420,15 @@ namespace Companion {
         return where;
     }
 
+    // "behind you", "to your left": where something is that is heard or close by and not seen
+    std::string DescribeSide(const View& view) {
+        const std::int32_t offDegrees = std::abs(view.angleDegrees);
+        if (offDegrees <= SPOT_AHEAD_DEGREES) return "ahead of you";
+        if (offDegrees >= SPOT_BEHIND_DEGREES) return "behind you";
+        return view.angleDegrees < 0 ? "to your left" : "to your right";
+    }
+
+    // Tells the companion of hostile characters it comes to see, to hear or to have close by, and of traps it sees
     void SpotDangers(RE::Actor* companion) {
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!companion || !player || companion->IsDead() || !companion->Is3DLoaded()) return;
@@ -2373,8 +2438,9 @@ namespace Companion {
         auto* physics = cell && canCastRays ? cell->GetbhkWorld() : nullptr;
         if (!physics) return;
 
-        std::vector<Spot> characters;
+        std::vector<Spot> hostiles;
         std::vector<Spot> traps;
+        const RE::NiPoint3 feet = companion->GetPosition();
         // A fight has events of its own, and who fights knows the enemy is there
         const bool isFighting = player->IsInCombat() || companion->IsInCombat();
         if (!isFighting && HasGameAddress(HOSTILE_TO_ACTOR_ID)) {
@@ -2390,7 +2456,9 @@ namespace Companion {
                 spot.position = actor->GetPosition();
                 spot.view = GetViewFrom(companion, spot.position);
                 spot.name = CleanText(ViewOf(actor->GetDisplayFullName()));
-                if (std::abs(spot.view.angleDegrees) <= SPOT_HALF_ANGLE_DEGREES && !spot.name.empty()) characters.push_back(std::move(spot));
+                spot.actor = actor;
+                spot.distanceUnits = feet.GetDistance(spot.position);
+                if (!spot.name.empty()) hostiles.push_back(std::move(spot));
                 return RE::BSContainer::ForEachResult::kContinue;
             });
         }
@@ -2406,36 +2474,61 @@ namespace Companion {
             spot.name = trap.name;
             traps.push_back(std::move(spot));
         }
-        if (characters.empty() && traps.empty()) return;
+        if (hostiles.empty() && traps.empty()) return;
 
-        // What was told already is left out before the walls are checked, which is the costly part
+        // The traps that were told already are left out before the walls are checked, which is the costly part
         const auto now = std::chrono::steady_clock::now();
         {
             const std::lock_guard<std::mutex> guard(eventLock);
-            std::erase_if(characters, [&](const Spot& spot) {
-                const auto known = spottedCharacters.find(spot.referenceID);
-                return known != spottedCharacters.end() && SecondsBetween(known->second, now) < SPOT_AGAIN_SECONDS;
-            });
             std::erase_if(traps, [&](const Spot& spot) { return spottedTraps.contains(spot.referenceID); });
         }
-        if (characters.empty() && traps.empty()) return;
+        if (hostiles.empty() && traps.empty()) return;
         {
             const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
-            const RE::NiPoint3 feet = companion->GetPosition();
             const RE::NiPoint3 eyes(feet.x, feet.y, feet.z + SIGHT_EYE_UNITS);
             const RE::BSReadLockGuard guard(physics->worldLock);
-            std::erase_if(characters, [&](const Spot& spot) { return !IsInSight(physics, scale, eyes, spot.position); });
+            for (auto& spot : hostiles) {
+                spot.sense = GetSenseOf(physics, scale, eyes, spot.actor, spot.view, spot.distanceUnits, SPOT_HALF_ANGLE_DEGREES);
+            }
             std::erase_if(traps, [&](const Spot& spot) { return !IsInSight(physics, scale, eyes, spot.position); });
         }
-        if (characters.empty() && traps.empty()) return;
-        std::sort(characters.begin(), characters.end(), [](const Spot& left, const Spot& right) { return left.view.distanceMeters < right.view.distanceMeters; });
+
+        // What is new: whom the companion sees, whom it has close by and whom it hears. Everyone is told once and
+        // then not again for a while, unless a sound has come within reach
+        std::vector<Spot> characters;
+        std::vector<Spot> closeOnes;
+        std::vector<Spot> heardOnes;
         {
             const std::lock_guard<std::mutex> guard(eventLock);
             if (spottedCharacters.size() > MAX_REMEMBERED_SPOTS) spottedCharacters.clear();
+            if (sensedCharacters.size() > MAX_REMEMBERED_SPOTS) sensedCharacters.clear();
             if (spottedTraps.size() > MAX_REMEMBERED_SPOTS) spottedTraps.clear();
-            for (const auto& spot : characters) spottedCharacters[spot.referenceID] = now;
+            for (const auto& spot : hostiles) {
+                const auto seenBefore = spottedCharacters.find(spot.referenceID);
+                const bool wasSeenLately = seenBefore != spottedCharacters.end() && SecondsBetween(seenBefore->second, now) < SPOT_AGAIN_SECONDS;
+                if (spot.sense == SENSE_SEEN) {
+                    if (wasSeenLately) continue;
+                    spottedCharacters[spot.referenceID] = now;
+                    characters.push_back(spot);
+                } else if (spot.sense == SENSE_CLOSE || spot.sense == SENSE_HEARD) {
+                    const auto sensedBefore = sensedCharacters.find(spot.referenceID);
+                    const bool wasSensedLately =
+                        sensedBefore != sensedCharacters.end() && SecondsBetween(sensedBefore->second.first, now) < SPOT_AGAIN_SECONDS;
+                    const bool hasComeClose = wasSensedLately && sensedBefore->second.second == SENSE_HEARD && spot.sense == SENSE_CLOSE;
+                    if (wasSensedLately && !hasComeClose) continue;
+                    // Whom the companion has just seen it knows of: a sound from there is nothing new. Within reach it is
+                    if (spot.sense == SENSE_HEARD && wasSeenLately) continue;
+                    sensedCharacters[spot.referenceID] = std::make_pair(now, spot.sense);
+                    if (spot.sense == SENSE_CLOSE) {
+                        closeOnes.push_back(spot);
+                    } else {
+                        heardOnes.push_back(spot);
+                    }
+                }
+            }
             for (const auto& spot : traps) spottedTraps.insert(spot.referenceID);
         }
+        std::sort(characters.begin(), characters.end(), [](const Spot& left, const Spot& right) { return left.view.distanceMeters < right.view.distanceMeters; });
         if (characters.size() == 1) {
             KeepEvent("You see a hostile " + characters.front().name + " " + DescribeSpot(characters.front().view) + ".", true, 0);
         } else if (!characters.empty()) {
@@ -2448,6 +2541,15 @@ namespace Companion {
                 ++shown;
             }
             if (characters.size() > shown) text += std::format(" and {} more", characters.size() - shown);
+            KeepEvent(text + ".", true, 0);
+        }
+        // Who is within reach is known by name. A sound is only a sound: the nearest one is told
+        for (const auto& spot : closeOnes) KeepEvent("A hostile " + spot.name + " is right " + DescribeSide(spot.view) + ", within reach.", true, 0);
+        if (!heardOnes.empty()) {
+            std::sort(heardOnes.begin(), heardOnes.end(), [](const Spot& left, const Spot& right) { return left.distanceUnits < right.distanceUnits; });
+            const auto& nearest = heardOnes.front();
+            std::string text = "You hear something " + DescribeSide(nearest.view) + std::format(", about {} m away", nearest.view.distanceMeters);
+            if (heardOnes.size() > 1) text += std::format(" (and {} more sounds around you)", heardOnes.size() - 1);
             KeepEvent(text + ".", true, 0);
         }
         for (const auto& spot : traps) KeepEvent("You see a trap (" + spot.name + ") " + DescribeSpot(spot.view) + ".", true, 0);
@@ -3811,11 +3913,15 @@ namespace Companion {
     // each nearest first. Five numbers per character, as the script built them before: ref ID, distance to the viewer
     // in meters, angle from where the viewer faces in degrees (negative = left), hostile to the player (for the dead:
     // how many different items they carry, plus 1), dead. Their names come from GetNearbyNames.
-    // A single -1 means: the plugin cannot look around in this game, the script has to do it itself
-    std::vector<std::int32_t> GetNearbyValues(RE::StaticFunctionTag*, RE::Actor* viewer, RE::Actor* companion, std::int32_t radiusMeters,
-                                              std::int32_t maxCharacters) {
+    // A single -1 means: the plugin cannot look around in this game, the script has to do it itself.
+    // senseHalfAngleDegrees: NO_SIGHT_FILTER = everyone around. Otherwise only whom the viewer notices: whom it sees
+    // within that many degrees to the left and right, whom it has close by and whom it hears (see GetSenseOf).
+    // senses then gets one number per character of the list: SENSE_SEEN, SENSE_CLOSE or SENSE_HEARD
+    std::vector<std::int32_t> CollectNearbyValues(RE::Actor* viewer, RE::Actor* companion, std::int32_t radiusMeters, std::int32_t maxCharacters,
+                                                  std::int32_t senseHalfAngleDegrees, std::vector<std::int32_t>& senses) {
         std::vector<std::int32_t> values;
         std::vector<std::string> names;
+        senses.clear();
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player || !viewer || !viewer->Is3DLoaded() || !HasGameAddress(WORLD_SINGLETON_ID)) {
             const std::lock_guard<std::mutex> guard(nearbyLock);
@@ -3826,6 +3932,7 @@ namespace Companion {
             RE::Actor* actor = nullptr;
             float distance = 0.0f;
             std::int32_t rank = NEARBY_RANK_LIVING;
+            std::int32_t sense = SENSE_SEEN;
         };
         const auto foughtHandle = companion ? companion->GetActorRuntimeData().currentCombatTarget.get() : RE::NiPointer<RE::Actor>();
         const RE::Actor* fought = foughtHandle.get();
@@ -3858,6 +3965,27 @@ namespace Companion {
                 return RE::BSContainer::ForEachResult::kContinue;
             });
         }
+        if (senseHalfAngleDegrees > NO_SIGHT_FILTER) {
+            // Only whom the viewer notices. Without the physics of the game the walls cannot be checked
+            const auto* viewerCell = viewer->GetParentCell();
+            const bool canCastRays = HasGameAddress(CELL_PHYSICS_ID) && HasGameAddress(PHYSICS_LOCK_ID) && HasGameAddress(PHYSICS_UNLOCK_ID);
+            auto* physics = viewerCell && canCastRays ? viewerCell->GetbhkWorld() : nullptr;
+            if (!physics) {
+                const std::lock_guard<std::mutex> guard(nearbyLock);
+                nearbyNames.clear();
+                return {NEARBY_NOT_KNOWN};
+            }
+            {
+                const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+                const RE::NiPoint3 eyes(own.x, own.y, own.z + SIGHT_EYE_UNITS);
+                const RE::BSReadLockGuard guard(physics->worldLock);
+                for (auto& character : seen) {
+                    character.sense = GetSenseOf(physics, scale, eyes, character.actor, GetViewFrom(viewer, character.actor->GetPosition()),
+                                                 character.distance, senseHalfAngleDegrees);
+                }
+            }
+            std::erase_if(seen, [](const SeenCharacter& character) { return character.sense == SENSE_NONE; });
+        }
         std::sort(seen.begin(), seen.end(), [](const SeenCharacter& left, const SeenCharacter& right) {
             if (left.rank != right.rank) return left.rank < right.rank;
             return left.distance < right.distance;
@@ -3878,6 +4006,7 @@ namespace Companion {
             values.push_back(view.angleDegrees);
             values.push_back(fourth);
             values.push_back(isDead ? 1 : 0);
+            senses.push_back(character.sense);
             // The place in the list goes in front, so that the server can tell which name belongs to which numbers
             names.push_back(std::to_string(names.size()) + ":" + CleanText(ViewOf(actor->GetDisplayFullName())));
         }
@@ -3886,6 +4015,13 @@ namespace Companion {
             nearbyNames = std::move(names);
         }
         return values;
+    }
+
+    // Everyone around the viewer (see CollectNearbyValues)
+    std::vector<std::int32_t> GetNearbyValues(RE::StaticFunctionTag*, RE::Actor* viewer, RE::Actor* companion, std::int32_t radiusMeters,
+                                              std::int32_t maxCharacters) {
+        std::vector<std::int32_t> senses;
+        return CollectNearbyValues(viewer, companion, radiusMeters, maxCharacters, NO_SIGHT_FILTER, senses);
     }
 
     // The names of the characters GetNearbyValues listed last: the place in that list, a colon and the name
@@ -4042,9 +4178,11 @@ namespace Companion {
                 const auto position = reference->GetPosition();
                 if (position.GetDistance(middle) > radius || std::abs(position.z - middle.z) > LOOSE_ITEM_HEIGHT_UNITS) return goOn;
                 if (CleanText(ViewOf(reference->GetDisplayFullName())).empty()) return goOn;
-                if (wanted == LOOSE_FILTER_NO_CLUTTER) {
+                // A script does not keep the case of a text: the game hands it "Potions" if it met the word like that
+                // first. In a test no potion was found for that reason
+                if (EqualsIgnoreCase(wanted, LOOSE_FILTER_NO_CLUTTER)) {
                     if (IsClutter(base)) return goOn;
-                } else if (!wanted.empty() && wanted != kind) {
+                } else if (!wanted.empty() && !EqualsIgnoreCase(wanted, kind)) {
                     return goOn;
                 }
                 if (reference->IsCrimeToActivate()) {
@@ -4132,6 +4270,10 @@ namespace Companion {
     constexpr std::size_t STATE_OPTION_ALIAS_PLAYER_HORSE = 30;
     constexpr std::size_t STATE_OPTION_ALIAS_CALLED_HORSE = 31;
     constexpr std::size_t STATE_OPTION_COUNT = 32;
+    // From interface version 25 on, and not needed for a state: 1 = only what the viewer notices is listed
+    // ('visible' with the companion as the viewer), and how many degrees to the left and right the viewer sees
+    constexpr std::size_t STATE_OPTION_VISIBLE = 32;
+    constexpr std::size_t STATE_OPTION_VISIBLE_HALF_ANGLE = 33;
 
     // What the companion walks to, what it rides to, what it looks at, whom it follows on foot and on horseback,
     // and the three quests of the game mod that keep the horses
@@ -4164,6 +4306,10 @@ namespace Companion {
     constexpr std::int32_t STATE_BLOCK_PLAYER_HORSE = 7;
     constexpr std::int32_t STATE_BLOCK_HORSE = 8;
     constexpr std::int32_t STATE_BLOCK_NEARBY = 9;
+    // With 'visible': by which sense the viewer notices each character of STATE_BLOCK_NEARBY (see SENSE_...)
+    constexpr std::int32_t STATE_BLOCK_NEARBY_SENSES = 10;
+    // The plugin tells how long it took in tenths of a millisecond: it is often done within one
+    constexpr std::int64_t MICROSECONDS_PER_TIME_STEP = 100;
 
     constexpr std::size_t STATE_PLAYER_VALUE_COUNT = 11;
     constexpr std::size_t STATE_WORLD_VALUE_COUNT = 7;
@@ -4266,7 +4412,8 @@ namespace Companion {
                                bool& isNameLost) {
         const std::string shownName(ViewOf(horse->GetDisplayFullName()));
         const std::string keptName = GetKeptHorseName(horse, namedHorses, horseNames);
-        isNameLost = !keptName.empty() && keptName != shownName;
+        // Texts that come from a script may differ in case from what the game shows (see FindLooseItems)
+        isNameLost = !keptName.empty() && !EqualsIgnoreCase(keptName, shownName);
         return CleanText(isNameLost ? keptName : shownName);
     }
 
@@ -4277,7 +4424,11 @@ namespace Companion {
         const auto startTime = std::chrono::steady_clock::now();
         std::vector<std::int32_t> numbers;
         std::vector<std::string> texts;
-        const bool canBuild = player && viewer && viewer->Is3DLoaded() && options.size() >= STATE_OPTION_COUNT && ownForms.size() >= STATE_FORM_COUNT;
+        // 'visible' is only built here with the companion as the viewer: what the player sees, the game tells by its camera
+        const bool isVisibleOnly = OptionOf(options, STATE_OPTION_VISIBLE) != 0;
+        const std::int32_t visibleHalfAngle = OptionOf(options, STATE_OPTION_VISIBLE_HALF_ANGLE);
+        const bool canBuild = player && viewer && viewer->Is3DLoaded() && options.size() >= STATE_OPTION_COUNT && ownForms.size() >= STATE_FORM_COUNT &&
+                              (!isVisibleOnly || (viewer != player && visibleHalfAngle > 0));
         if (!canBuild) {
             const std::lock_guard<std::mutex> guard(wholeStateLock);
             wholeStateTexts.clear();
@@ -4287,9 +4438,10 @@ namespace Companion {
         // The characters around come first: if the game cannot be searched, nothing else is touched
         const auto* viewerCell = viewer->GetParentCell();
         const bool isViewerIndoors = viewerCell && viewerCell->IsInteriorCell();
-        const std::vector<std::int32_t> nearbyValues = GetNearbyValues(
-            nullptr, viewer, companion, OptionOf(options, isViewerIndoors ? STATE_OPTION_INDOOR_RADIUS : STATE_OPTION_OUTDOOR_RADIUS),
-            OptionOf(options, STATE_OPTION_LIST_LIMIT));
+        std::vector<std::int32_t> nearbySenses;
+        const std::vector<std::int32_t> nearbyValues = CollectNearbyValues(
+            viewer, companion, OptionOf(options, isViewerIndoors ? STATE_OPTION_INDOOR_RADIUS : STATE_OPTION_OUTDOOR_RADIUS),
+            OptionOf(options, STATE_OPTION_LIST_LIMIT), isVisibleOnly ? visibleHalfAngle : NO_SIGHT_FILTER, nearbySenses);
         if (nearbyValues.size() == 1) {
             const std::lock_guard<std::mutex> guard(wholeStateLock);
             wholeStateTexts.clear();
@@ -4301,7 +4453,8 @@ namespace Companion {
 
         numbers.assign(STATE_HEAD_COUNT, 0);
         numbers[STATE_HEAD_LENGTH] = static_cast<std::int32_t>(STATE_HEAD_COUNT);
-        // The script fills in the first of the two times, the second is how long this function took
+        // The script fills in the first of the two times in milliseconds. The second is how long this function took,
+        // in tenths of a millisecond (see MICROSECONDS_PER_TIME_STEP)
         AddStateBlock(numbers, STATE_BLOCK_TIMES, {0, 0});
         const std::size_t placeOfOwnTime = numbers.size() - 1;
 
@@ -4333,15 +4486,16 @@ namespace Companion {
         worldValues[3] = isHearingWanted ? 1 : 0;
         worldValues[4] = OptionOf(options, STATE_OPTION_PROTOCOL);
         worldValues[5] = viewer != player ? 1 : 0;
-        // The last one says whether only what the viewer can see is listed. Such a state is built the old way
+        worldValues[6] = isVisibleOnly ? 1 : 0;
         AddStateBlock(numbers, STATE_BLOCK_WORLD, worldValues);
 
         const std::int32_t maxQuests = OptionOf(options, STATE_OPTION_MAX_QUESTS);
         AddStateTexts(texts, "quests", GetOpenQuests(nullptr, maxQuests));
         AddStateTexts(texts, "quest_targets", GetQuestTargets(nullptr, maxQuests, OptionOf(options, STATE_OPTION_MAX_QUEST_TARGETS), viewer));
+        // 'visible': only the places and doors in front of the viewer with nothing solid in between
         AddStateTexts(texts, "places",
-                      GetNearbyPlaces(nullptr, OptionOf(options, STATE_OPTION_PLACE_RADIUS), OptionOf(options, STATE_OPTION_MAX_PLACE_MARKERS),
-                                      OptionOf(options, STATE_OPTION_MAX_PLACE_DOORS), viewer));
+                      GetPlaceLines(OptionOf(options, STATE_OPTION_PLACE_RADIUS), OptionOf(options, STATE_OPTION_MAX_PLACE_MARKERS),
+                                    OptionOf(options, STATE_OPTION_MAX_PLACE_DOORS), viewer, isVisibleOnly ? visibleHalfAngle : NO_SIGHT_FILTER));
         AddStateTexts(texts, "traps", GetNearbyTraps(nullptr, OptionOf(options, STATE_OPTION_TRAP_RADIUS), OptionOf(options, STATE_OPTION_MAX_TRAPS), viewer));
         if (isHearingWanted) AddStateTexts(texts, "heard", TakeHeardLines(nullptr, OptionOf(options, STATE_OPTION_MAX_HEARD_LINES)));
         AddStateTexts(texts, "events", TakeEvents(nullptr, OptionOf(options, STATE_OPTION_MAX_EVENT_LINES)));
@@ -4444,11 +4598,12 @@ namespace Companion {
 
         if (nearbyValues.size() > 1) {
             AddStateBlock(numbers, STATE_BLOCK_NEARBY, nearbyValues);
+            if (isVisibleOnly) AddStateBlock(numbers, STATE_BLOCK_NEARBY_SENSES, nearbySenses);
             AddStateTexts(texts, "nearby_names", GetNearbyNames(nullptr));
         }
 
         numbers[placeOfOwnTime] = static_cast<std::int32_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count());
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - startTime).count() / MICROSECONDS_PER_TIME_STEP);
         {
             const std::lock_guard<std::mutex> guard(wholeStateLock);
             wholeStateTexts = std::move(texts);
