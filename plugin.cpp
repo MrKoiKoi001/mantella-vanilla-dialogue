@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 23;
+    constexpr std::int32_t INTERFACE_VERSION = 24;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -4077,6 +4077,391 @@ namespace Companion {
         return {looseOwnedCount, looseMoreCount};
     }
 
+    // The two functions below exist from interface version 24 on
+
+    // ------------------------------------------------------------ the whole state in one go
+    // Nearly every question a script asks the game waits for the next picture, and so does every value it puts into
+    // its request to the companion server. A state took about two seconds that way, with about a hundred questions.
+    // GetWholeState answers what goes along with every state in one go and packs it, so that the script hands it on
+    // with two values: a list of numbers (what GetWholeState returns) and a list of texts (GetWholeStateTexts).
+    // The companion server unpacks both again (expand_quick_state in game_state.py of the Mantella fork).
+    //
+    // The numbers: first STATE_HEAD_COUNT numbers for the script itself (see STATE_HEAD_...), then one block per list
+    // of the state: which list (STATE_BLOCK_...), how many numbers, the numbers. Every block is built the way the
+    // script built that list before (BuildState and BuildCompanionValues in KI_MCP_Gefaehrte_Loop.psc).
+    // The texts: the name of the entry of the state, a tab, the text. A list of texts has one line per text.
+    // What only the script knows it hands in: numbers (STATE_OPTION_...) and forms (STATE_FORM_...). The same
+    // places are named in the script (StateOption..., StateForm...) and must be kept the same there
+
+    constexpr std::size_t STATE_OPTION_PROTOCOL = 0;
+    constexpr std::size_t STATE_OPTION_LIST_LIMIT = 1;
+    constexpr std::size_t STATE_OPTION_MUTE = 2;
+    constexpr std::size_t STATE_OPTION_HEARING = 3;
+    // What the game told the script about the player and the companion. These stay questions of the script, because
+    // nothing here is known to answer them exactly like the script functions do
+    constexpr std::size_t STATE_OPTION_PLAYER_HEALTH = 4;
+    constexpr std::size_t STATE_OPTION_PLAYER_SIT_STATE = 5;
+    constexpr std::size_t STATE_OPTION_PLAYER_SLEEP_STATE = 6;
+    constexpr std::size_t STATE_OPTION_COMPANION_HEALTH = 7;
+    constexpr std::size_t STATE_OPTION_COMPANION_SIT_STATE = 8;
+    constexpr std::size_t STATE_OPTION_COMPANION_RUNS = 9;
+    // What the script keeps itself
+    constexpr std::size_t STATE_OPTION_RIDE_HOLD = 10;
+    constexpr std::size_t STATE_OPTION_FLEEING = 11;
+    constexpr std::size_t STATE_OPTION_KEEPS_WEAPON_AWAY = 12;
+    constexpr std::size_t STATE_OPTION_SNEAK_MODE = 13;
+    constexpr std::size_t STATE_OPTION_AUTO_HEAL_PERCENT = 14;
+    constexpr std::size_t STATE_OPTION_LEAD_STATE = 15;
+    constexpr std::size_t STATE_OPTION_RIDE_LOCKED = 16;
+    // How long the lists may get and how far they look, as the script handed it to the single functions before
+    constexpr std::size_t STATE_OPTION_MAX_QUESTS = 17;
+    constexpr std::size_t STATE_OPTION_MAX_QUEST_TARGETS = 18;
+    constexpr std::size_t STATE_OPTION_PLACE_RADIUS = 19;
+    constexpr std::size_t STATE_OPTION_MAX_PLACE_MARKERS = 20;
+    constexpr std::size_t STATE_OPTION_MAX_PLACE_DOORS = 21;
+    constexpr std::size_t STATE_OPTION_TRAP_RADIUS = 22;
+    constexpr std::size_t STATE_OPTION_MAX_TRAPS = 23;
+    constexpr std::size_t STATE_OPTION_MAX_HEARD_LINES = 24;
+    constexpr std::size_t STATE_OPTION_MAX_EVENT_LINES = 25;
+    constexpr std::size_t STATE_OPTION_INDOOR_RADIUS = 26;
+    constexpr std::size_t STATE_OPTION_OUTDOOR_RADIUS = 27;
+    // In which alias of its quests the game mod keeps the rider, its horse, the horse of the player and the horse
+    // that was called
+    constexpr std::size_t STATE_OPTION_ALIAS_RIDER = 28;
+    constexpr std::size_t STATE_OPTION_ALIAS_HORSE = 29;
+    constexpr std::size_t STATE_OPTION_ALIAS_PLAYER_HORSE = 30;
+    constexpr std::size_t STATE_OPTION_ALIAS_CALLED_HORSE = 31;
+    constexpr std::size_t STATE_OPTION_COUNT = 32;
+
+    // What the companion walks to, what it rides to, what it looks at, whom it follows on foot and on horseback,
+    // and the three quests of the game mod that keep the horses
+    constexpr std::size_t STATE_FORM_WALK_TARGET = 0;
+    constexpr std::size_t STATE_FORM_RIDE_TARGET = 1;
+    constexpr std::size_t STATE_FORM_LOOK_TARGET = 2;
+    constexpr std::size_t STATE_FORM_LEADER = 3;
+    constexpr std::size_t STATE_FORM_RIDE_LEADER = 4;
+    constexpr std::size_t STATE_FORM_HORSE_QUEST = 5;
+    constexpr std::size_t STATE_FORM_PLAYER_HORSE_QUEST = 6;
+    constexpr std::size_t STATE_FORM_HORSE_CALL_QUEST = 7;
+    constexpr std::size_t STATE_FORM_COUNT = 8;
+
+    // For the script: how many numbers come before the first block, whether the player and the companion ride (so it
+    // need not ask on what they sit otherwise), and whether a horse has lost the name the script gave it
+    constexpr std::size_t STATE_HEAD_LENGTH = 0;
+    constexpr std::size_t STATE_HEAD_PLAYER_RIDES = 1;
+    constexpr std::size_t STATE_HEAD_COMPANION_RIDES = 2;
+    constexpr std::size_t STATE_HEAD_PLAYER_HORSE_NAME_LOST = 3;
+    constexpr std::size_t STATE_HEAD_OWN_HORSE_NAME_LOST = 4;
+    constexpr std::size_t STATE_HEAD_COUNT = 5;
+
+    // The lists of numbers. The times come first: the script writes how long it took itself into the first of them
+    constexpr std::int32_t STATE_BLOCK_TIMES = 1;
+    constexpr std::int32_t STATE_BLOCK_PLAYER = 2;
+    constexpr std::int32_t STATE_BLOCK_WORLD = 3;
+    constexpr std::int32_t STATE_BLOCK_COMPANION = 4;
+    constexpr std::int32_t STATE_BLOCK_GOLD = 5;
+    constexpr std::int32_t STATE_BLOCK_HORSE_CALLED = 6;
+    constexpr std::int32_t STATE_BLOCK_PLAYER_HORSE = 7;
+    constexpr std::int32_t STATE_BLOCK_HORSE = 8;
+    constexpr std::int32_t STATE_BLOCK_NEARBY = 9;
+
+    constexpr std::size_t STATE_PLAYER_VALUE_COUNT = 11;
+    constexpr std::size_t STATE_WORLD_VALUE_COUNT = 7;
+    constexpr std::size_t STATE_COMPANION_VALUE_COUNT = 22;
+    constexpr std::int32_t WEATHER_NOT_KNOWN = -1;
+    constexpr std::int32_t WEATHER_PLEASANT = 0;
+    constexpr std::int32_t WEATHER_CLOUDY = 1;
+    constexpr std::int32_t WEATHER_RAINY = 2;
+    constexpr std::int32_t WEATHER_SNOW = 3;
+    constexpr float MINUTES_PER_DAY = 24.0f * MINUTES_PER_HOUR;
+    constexpr std::int32_t HORSE_NOT_LOADED = -1;
+    constexpr std::string_view UNKNOWN_LOCATION_NAME = "Unknown";
+    constexpr char STATE_TEXT_SEPARATOR = '\t';
+
+    std::mutex wholeStateLock;
+    // The texts that belong to the numbers GetWholeState returned last
+    std::vector<std::string> wholeStateTexts;
+
+    std::int32_t OptionOf(const std::vector<std::int32_t>& options, std::size_t place) { return place < options.size() ? options[place] : 0; }
+
+    RE::TESForm* FormOf(const std::vector<RE::TESForm*>& forms, std::size_t place) { return place < forms.size() ? forms[place] : nullptr; }
+
+    std::int32_t IdOf(const RE::TESForm* form) { return form ? static_cast<std::int32_t>(form->GetFormID()) : 0; }
+
+    void AddStateBlock(std::vector<std::int32_t>& numbers, std::int32_t block, const std::vector<std::int32_t>& values) {
+        numbers.push_back(block);
+        numbers.push_back(static_cast<std::int32_t>(values.size()));
+        numbers.insert(numbers.end(), values.begin(), values.end());
+    }
+
+    void AddStateText(std::vector<std::string>& texts, std::string_view key, std::string_view text) {
+        std::string line(key);
+        line += STATE_TEXT_SEPARATOR;
+        line += text;
+        texts.push_back(std::move(line));
+    }
+
+    void AddStateTexts(std::vector<std::string>& texts, std::string_view key, const std::vector<std::string>& lines) {
+        for (const auto& line : lines) AddStateText(texts, key, line);
+    }
+
+    // The character a quest keeps in one of its aliases, or nullptr. This is what ReferenceAlias.GetActorReference
+    // tells a script (see RE::BGSRefAlias::GetReference)
+    RE::Actor* GetAliasActor(const RE::TESForm* questForm, std::int32_t aliasID) {
+        const auto* quest = questForm ? questForm->As<RE::TESQuest>() : nullptr;
+        if (!quest || aliasID < 0) return nullptr;
+        const auto reference = quest->GetAliasedRef(static_cast<std::uint32_t>(aliasID)).get();
+        return reference ? reference->As<RE::Actor>() : nullptr;
+    }
+
+    // The name of the place the player is in, as the script found it before: the location, or else the cell,
+    // or else the world
+    std::string GetLocationNameOf(const RE::Actor* player) {
+        std::string name;
+        if (const auto* location = player->GetCurrentLocation()) name = CleanText(ViewOf(location->GetName()));
+        if (name.empty()) {
+            if (const auto* cell = player->GetParentCell()) name = CleanText(ViewOf(cell->GetName()));
+        }
+        if (name.empty()) {
+            if (const auto* world = player->GetWorldspace()) name = CleanText(ViewOf(world->GetName()));
+        }
+        if (name.empty()) name = UNKNOWN_LOCATION_NAME;
+        return name;
+    }
+
+    // The weather as Weather.GetClassification tells it to a script: WEATHER_PLEASANT to WEATHER_SNOW by the kind
+    // the weather is marked as, WEATHER_NOT_KNOWN without a weather or without a mark
+    std::int32_t GetWeatherClass() {
+        const auto* sky = RE::Sky::GetSingleton();
+        const auto* weather = sky ? sky->currentWeather : nullptr;
+        if (!weather) return WEATHER_NOT_KNOWN;
+        const auto& marks = weather->data.flags;
+        if (marks.any(RE::TESWeather::WeatherDataFlag::kPleasant)) return WEATHER_PLEASANT;
+        if (marks.any(RE::TESWeather::WeatherDataFlag::kCloudy)) return WEATHER_CLOUDY;
+        if (marks.any(RE::TESWeather::WeatherDataFlag::kRainy)) return WEATHER_RAINY;
+        if (marks.any(RE::TESWeather::WeatherDataFlag::kSnow)) return WEATHER_SNOW;
+        return WEATHER_NOT_KNOWN;
+    }
+
+    // The time of day in minutes since midnight, worked out like the script did: from the days since the game began
+    std::int32_t GetMinutesOfDay() {
+        const auto* calendar = RE::Calendar::GetSingleton();
+        if (!calendar) return 0;
+        const float days = calendar->GetCurrentGameTime();
+        return static_cast<std::int32_t>((days - std::floor(days)) * MINUTES_PER_DAY);
+    }
+
+    // The name the script gave a horse with rename_horse, or an empty text if it gave none
+    std::string GetKeptHorseName(const RE::Actor* horse, const std::vector<RE::TESForm*>& namedHorses, const std::vector<RE::BSFixedString>& horseNames) {
+        if (namedHorses.size() != horseNames.size()) return std::string();
+        for (std::size_t place = 0; place < namedHorses.size(); ++place) {
+            if (namedHorses[place] == horse) return std::string(ViewOf(horseNames[place].c_str()));
+        }
+        return std::string();
+    }
+
+    // The name of a horse for the state. The game sometimes forgets a name a script gave: then the name the script
+    // gave is told, and isNameLost says that the script has to give it again
+    std::string GetHorseNameOf(RE::Actor* horse, const std::vector<RE::TESForm*>& namedHorses, const std::vector<RE::BSFixedString>& horseNames,
+                               bool& isNameLost) {
+        const std::string shownName(ViewOf(horse->GetDisplayFullName()));
+        const std::string keptName = GetKeptHorseName(horse, namedHorses, horseNames);
+        isNameLost = !keptName.empty() && keptName != shownName;
+        return CleanText(isNameLost ? keptName : shownName);
+    }
+
+    // See the comment above. An empty list means: this state cannot be built here, the script builds it the old way
+    std::vector<std::int32_t> GetWholeState(RE::StaticFunctionTag*, RE::Actor* player, RE::Actor* companion, RE::Actor* viewer,
+                                            std::vector<RE::TESForm*> ownForms, std::vector<std::int32_t> options,
+                                            std::vector<RE::TESForm*> namedHorses, std::vector<RE::BSFixedString> horseNames) {
+        const auto startTime = std::chrono::steady_clock::now();
+        std::vector<std::int32_t> numbers;
+        std::vector<std::string> texts;
+        const bool canBuild = player && viewer && viewer->Is3DLoaded() && options.size() >= STATE_OPTION_COUNT && ownForms.size() >= STATE_FORM_COUNT;
+        if (!canBuild) {
+            const std::lock_guard<std::mutex> guard(wholeStateLock);
+            wholeStateTexts.clear();
+            return numbers;
+        }
+
+        // The characters around come first: if the game cannot be searched, nothing else is touched
+        const auto* viewerCell = viewer->GetParentCell();
+        const bool isViewerIndoors = viewerCell && viewerCell->IsInteriorCell();
+        const std::vector<std::int32_t> nearbyValues = GetNearbyValues(
+            nullptr, viewer, companion, OptionOf(options, isViewerIndoors ? STATE_OPTION_INDOOR_RADIUS : STATE_OPTION_OUTDOOR_RADIUS),
+            OptionOf(options, STATE_OPTION_LIST_LIMIT));
+        if (nearbyValues.size() == 1) {
+            const std::lock_guard<std::mutex> guard(wholeStateLock);
+            wholeStateTexts.clear();
+            return numbers;
+        }
+
+        // Whose own sentences of the game are cut off (see SetMutedSpeaker): the script told that with every state
+        SetMutedSpeaker(nullptr, OptionOf(options, STATE_OPTION_MUTE) != 0 ? companion : nullptr);
+
+        numbers.assign(STATE_HEAD_COUNT, 0);
+        numbers[STATE_HEAD_LENGTH] = static_cast<std::int32_t>(STATE_HEAD_COUNT);
+        // The script fills in the first of the two times, the second is how long this function took
+        AddStateBlock(numbers, STATE_BLOCK_TIMES, {0, 0});
+        const std::size_t placeOfOwnTime = numbers.size() - 1;
+
+        AddStateText(texts, "location", GetLocationNameOf(player));
+        AddStateText(texts, "player_name", CleanText(ViewOf(player->GetDisplayFullName())));
+
+        const std::vector<std::int32_t> playerNumbers = GetActorNumbers(nullptr, player, nullptr);
+        const auto* playerCell = player->GetParentCell();
+        std::vector<std::int32_t> playerValues(STATE_PLAYER_VALUE_COUNT, 0);
+        playerValues[0] = OptionOf(options, STATE_OPTION_PLAYER_HEALTH);
+        playerValues[1] = playerNumbers[2];
+        playerValues[2] = playerNumbers[3];
+        playerValues[3] = playerNumbers[4];
+        playerValues[4] = playerNumbers[5];
+        playerValues[5] = playerNumbers[6];
+        playerValues[6] = playerCell && playerCell->IsInteriorCell() ? 1 : 0;
+        playerValues[7] = playerNumbers[7];
+        playerValues[8] = OptionOf(options, STATE_OPTION_PLAYER_SIT_STATE);
+        playerValues[9] = OptionOf(options, STATE_OPTION_PLAYER_SLEEP_STATE);
+        playerValues[10] = playerNumbers[8];
+        AddStateBlock(numbers, STATE_BLOCK_PLAYER, playerValues);
+        numbers[STATE_HEAD_PLAYER_RIDES] = playerNumbers[14];
+
+        const bool isHearingWanted = OptionOf(options, STATE_OPTION_HEARING) != 0;
+        std::vector<std::int32_t> worldValues(STATE_WORLD_VALUE_COUNT, 0);
+        worldValues[0] = GetWeatherClass();
+        worldValues[1] = GetMinutesOfDay();
+        worldValues[2] = INTERFACE_VERSION;
+        worldValues[3] = isHearingWanted ? 1 : 0;
+        worldValues[4] = OptionOf(options, STATE_OPTION_PROTOCOL);
+        worldValues[5] = viewer != player ? 1 : 0;
+        // The last one says whether only what the viewer can see is listed. Such a state is built the old way
+        AddStateBlock(numbers, STATE_BLOCK_WORLD, worldValues);
+
+        const std::int32_t maxQuests = OptionOf(options, STATE_OPTION_MAX_QUESTS);
+        AddStateTexts(texts, "quests", GetOpenQuests(nullptr, maxQuests));
+        AddStateTexts(texts, "quest_targets", GetQuestTargets(nullptr, maxQuests, OptionOf(options, STATE_OPTION_MAX_QUEST_TARGETS), viewer));
+        AddStateTexts(texts, "places",
+                      GetNearbyPlaces(nullptr, OptionOf(options, STATE_OPTION_PLACE_RADIUS), OptionOf(options, STATE_OPTION_MAX_PLACE_MARKERS),
+                                      OptionOf(options, STATE_OPTION_MAX_PLACE_DOORS), viewer));
+        AddStateTexts(texts, "traps", GetNearbyTraps(nullptr, OptionOf(options, STATE_OPTION_TRAP_RADIUS), OptionOf(options, STATE_OPTION_MAX_TRAPS), viewer));
+        if (isHearingWanted) AddStateTexts(texts, "heard", TakeHeardLines(nullptr, OptionOf(options, STATE_OPTION_MAX_HEARD_LINES)));
+        AddStateTexts(texts, "events", TakeEvents(nullptr, OptionOf(options, STATE_OPTION_MAX_EVENT_LINES)));
+
+        // The horses: who rides what is kept in aliases of the quests of the game mod
+        const auto* horseQuest = FormOf(ownForms, STATE_FORM_HORSE_QUEST);
+        const bool isRideWanted = GetAliasActor(horseQuest, OptionOf(options, STATE_OPTION_ALIAS_RIDER)) != nullptr;
+
+        if (companion) {
+            AddStateText(texts, "companion_name", CleanText(ViewOf(companion->GetDisplayFullName())));
+            const RE::BSFixedString voiceName = GetVoiceTypeName(nullptr, companion);
+            if (!voiceName.empty()) AddStateText(texts, "companion_voice", ViewOf(voiceName.c_str()));
+            if (!companion->Is3DLoaded()) {
+                // Where the companion is if it is not in the loaded area: the name of the building, if the game has one
+                const auto* companionCell = companion->GetParentCell();
+                const std::string placeName = companionCell ? CleanText(ViewOf(companionCell->GetName())) : std::string();
+                if (!placeName.empty()) AddStateText(texts, "companion_place", placeName);
+            }
+
+            const std::vector<std::int32_t> companionNumbers = GetActorNumbers(nullptr, companion, player);
+            std::vector<std::int32_t> companionValues(STATE_COMPANION_VALUE_COUNT, 0);
+            companionValues[0] = companionNumbers[0];
+            companionValues[1] = OptionOf(options, STATE_OPTION_COMPANION_HEALTH);
+            companionValues[2] = companionNumbers[1];
+            companionValues[3] = companionNumbers[2];
+            const bool isHeldOnHorse = OptionOf(options, STATE_OPTION_RIDE_HOLD) != 0 && isRideWanted;
+            companionValues[4] = companionNumbers[13] != 0 || isHeldOnHorse ? 1 : 0;
+            // Far away (eg left behind in another place) the game has no position worth measuring
+            if (companionNumbers[9] != 0) {
+                companionValues[5] = 1;
+                companionValues[6] = companionNumbers[10];
+                companionValues[7] = companionNumbers[11];
+                companionValues[9] = companionNumbers[6];
+            }
+            companionValues[8] = companionNumbers[12];
+            companionValues[10] = OptionOf(options, STATE_OPTION_FLEEING);
+            if (const auto* walkTarget = FormOf(ownForms, STATE_FORM_WALK_TARGET)) {
+                companionValues[11] = IdOf(walkTarget);
+            } else if (isRideWanted) {
+                companionValues[11] = IdOf(FormOf(ownForms, STATE_FORM_RIDE_TARGET));
+            }
+            companionValues[12] = OptionOf(options, STATE_OPTION_COMPANION_SIT_STATE);
+            companionValues[13] = companionNumbers[7];
+            companionValues[14] = IdOf(FormOf(ownForms, STATE_FORM_LOOK_TARGET));
+            if (const auto* leader = FormOf(ownForms, STATE_FORM_LEADER)) {
+                companionValues[15] = IdOf(leader);
+            } else if (isRideWanted) {
+                companionValues[15] = IdOf(FormOf(ownForms, STATE_FORM_RIDE_LEADER));
+            }
+            companionValues[16] = OptionOf(options, STATE_OPTION_KEEPS_WEAPON_AWAY);
+            companionValues[17] = OptionOf(options, STATE_OPTION_COMPANION_RUNS);
+            companionValues[18] = companionNumbers[8];
+            companionValues[19] = OptionOf(options, STATE_OPTION_SNEAK_MODE);
+            companionValues[20] = OptionOf(options, STATE_OPTION_AUTO_HEAL_PERCENT);
+            companionValues[21] = OptionOf(options, STATE_OPTION_LEAD_STATE);
+            AddStateBlock(numbers, STATE_BLOCK_COMPANION, companionValues);
+            numbers[STATE_HEAD_COMPANION_RIDES] = companionNumbers[14];
+
+            // What the companion holds, as GetHandNames tells it, with the names made safe to send
+            for (const auto& hand : GetHandNames(nullptr, companion)) {
+                const std::string_view handView(hand);
+                const auto colon = handView.find(':');
+                if (colon == std::string_view::npos) continue;
+                AddStateText(texts, "hands", std::string(handView.substr(0, colon + 1)) + CleanText(handView.substr(colon + 1)));
+            }
+        }
+
+        // Gold of the player and of the companion (0 without a companion)
+        AddStateBlock(numbers, STATE_BLOCK_GOLD, {CountInInventory(player, GOLD_FORM_ID), companion ? CountInInventory(companion, GOLD_FORM_ID) : 0});
+
+        if (const auto* calledHorse = GetAliasActor(FormOf(ownForms, STATE_FORM_HORSE_CALL_QUEST), OptionOf(options, STATE_OPTION_ALIAS_CALLED_HORSE))) {
+            AddStateBlock(numbers, STATE_BLOCK_HORSE_CALLED, {IdOf(calledHorse)});
+        }
+        auto* playersHorse = GetAliasActor(FormOf(ownForms, STATE_FORM_PLAYER_HORSE_QUEST), OptionOf(options, STATE_OPTION_ALIAS_PLAYER_HORSE));
+        if (playersHorse && !playersHorse->IsDead()) {
+            const std::vector<std::int32_t> horseNumbers = GetActorNumbers(nullptr, playersHorse, player);
+            std::vector<std::int32_t> horseValues = {horseNumbers[0], HORSE_NOT_LOADED, 0};
+            if (horseNumbers[9] != 0) {
+                horseValues[1] = horseNumbers[10];
+                horseValues[2] = horseNumbers[11];
+            }
+            AddStateBlock(numbers, STATE_BLOCK_PLAYER_HORSE, horseValues);
+            bool isNameLost = false;
+            AddStateText(texts, "player_horse_name", GetHorseNameOf(playersHorse, namedHorses, horseNames, isNameLost));
+            numbers[STATE_HEAD_PLAYER_HORSE_NAME_LOST] = isNameLost ? 1 : 0;
+        }
+        auto* ownHorse = companion ? GetAliasActor(horseQuest, OptionOf(options, STATE_OPTION_ALIAS_HORSE)) : nullptr;
+        if (ownHorse && !ownHorse->IsDead()) {
+            const std::vector<std::int32_t> horseNumbers = GetActorNumbers(nullptr, ownHorse, companion);
+            std::vector<std::int32_t> horseValues = {horseNumbers[0], HORSE_NOT_LOADED, 0, isRideWanted ? 1 : 0, OptionOf(options, STATE_OPTION_RIDE_LOCKED)};
+            if (horseNumbers[9] != 0 && companion->Is3DLoaded()) {
+                horseValues[1] = horseNumbers[10];
+                horseValues[2] = horseNumbers[11];
+            }
+            AddStateBlock(numbers, STATE_BLOCK_HORSE, horseValues);
+            bool isNameLost = false;
+            AddStateText(texts, "horse_name", GetHorseNameOf(ownHorse, namedHorses, horseNames, isNameLost));
+            numbers[STATE_HEAD_OWN_HORSE_NAME_LOST] = isNameLost ? 1 : 0;
+        }
+
+        if (nearbyValues.size() > 1) {
+            AddStateBlock(numbers, STATE_BLOCK_NEARBY, nearbyValues);
+            AddStateTexts(texts, "nearby_names", GetNearbyNames(nullptr));
+        }
+
+        numbers[placeOfOwnTime] = static_cast<std::int32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime).count());
+        {
+            const std::lock_guard<std::mutex> guard(wholeStateLock);
+            wholeStateTexts = std::move(texts);
+        }
+        return numbers;
+    }
+
+    // The texts that belong to the numbers GetWholeState returned last: the name of the entry, a tab, the text
+    std::vector<std::string> GetWholeStateTexts(RE::StaticFunctionTag*) {
+        const std::lock_guard<std::mutex> guard(wholeStateLock);
+        return wholeStateTexts;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -4125,6 +4510,8 @@ namespace Companion {
         vm->RegisterFunction("GetHandNames", SCRIPT_NAME, GetHandNames);
         vm->RegisterFunction("FindLooseItems", SCRIPT_NAME, FindLooseItems);
         vm->RegisterFunction("GetLooseItemNumbers", SCRIPT_NAME, GetLooseItemNumbers);
+        vm->RegisterFunction("GetWholeState", SCRIPT_NAME, GetWholeState);
+        vm->RegisterFunction("GetWholeStateTexts", SCRIPT_NAME, GetWholeStateTexts);
         return true;
     }
 
