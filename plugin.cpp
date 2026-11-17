@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 28;
+    constexpr std::int32_t INTERFACE_VERSION = 32;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -1233,12 +1233,20 @@ namespace Companion {
     // in each direction, whether the ground only rises there, and where the ground drops away.
     // The rays go from the character, so it does not matter where the player or the camera is
 
+    constexpr float NO_WATER_ON_RAY = -1.0f;
+
     struct RayHit {
         bool isHit = false;
         // From the start of the ray, in game units
         float distance = 0.0f;
         // How much the surface that was hit faces upwards: 1 = flat ground, 0 = an upright wall
         float normalUp = 0.0f;
+        // The ray met nothing solid, but it did not get to its end either: it went through as many things that are
+        // no obstacle as it may. So "nothing was hit" does not mean that nothing is there
+        bool isCutShort = false;
+        // How far from the start the ray first met something in the layer the game has for water, on its way to what
+        // stopped it. NO_WATER_ON_RAY if it met none. Whether water has a body in that layer at all only the game shows
+        float waterDistance = NO_WATER_ON_RAY;
     };
 
     // Whether something in this layer of the physics stops a walking character for good: the world itself,
@@ -1262,14 +1270,14 @@ namespace Companion {
     }
 
     // Sends a ray from one point to another (both in game units) and returns the first solid thing in its way
-    RayHit CastRay(RE::bhkWorld* physics, float scale, const RE::NiPoint3& from, const RE::NiPoint3& to) {
+    RayHit CastRay(RE::bhkWorld* physics, float scale, const RE::NiPoint3& from, const RE::NiPoint3& to, std::int32_t maxPasses = MAX_RAY_PASSES) {
         RayHit result;
         const RE::NiPoint3 whole = to - from;
         const float length = whole.Length();
         if (length <= 0.0f) return result;
         const RE::NiPoint3 direction = whole / length;
         float covered = 0.0f;
-        for (std::int32_t pass = 0; pass < MAX_RAY_PASSES && covered < length; ++pass) {
+        for (std::int32_t pass = 0; pass < maxPasses && covered < length; ++pass) {
             const RE::NiPoint3 start = from + direction * covered;
             RE::bhkPickData pick;
             pick.rayInput.from = RE::hkVector4(start.x * scale, start.y * scale, start.z * scale, 0.0f);
@@ -1277,7 +1285,9 @@ namespace Companion {
             physics->PickObject(pick);
             if (!pick.rayOutput.HasHit()) return result;
             const float hitDistance = covered + pick.rayOutput.hitFraction * (length - covered);
-            if (IsSolidLayer(pick.rayOutput.rootCollidable->GetCollisionLayer())) {
+            const RE::COL_LAYER hitLayer = pick.rayOutput.rootCollidable->GetCollisionLayer();
+            if (hitLayer == RE::COL_LAYER::kWater && result.waterDistance < 0.0f) result.waterDistance = hitDistance;
+            if (IsSolidLayer(hitLayer)) {
                 float normal[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 _mm_storeu_ps(normal, pick.rayOutput.normal.quad);
                 result.isHit = true;
@@ -1287,6 +1297,7 @@ namespace Companion {
             }
             covered = hitDistance + RAY_PASS_STEP_UNITS;
         }
+        result.isCutShort = covered < length;
         return result;
     }
 
@@ -2374,16 +2385,37 @@ namespace Companion {
         return isMoving ? HEAR_WALKING_UNITS : HEAR_STILL_UNITS;
     }
 
+    // How far a viewer sees at the moment, by the weather, the time of day and the light (see UpdateSight further
+    // down, which works it out and keeps it here). It holds for the viewer it was worked out for, and only for a few
+    // seconds: the script asks for it anew with every state that is about seeing. Everything else sees without a limit
+    constexpr float NO_SIGHT_LIMIT_UNITS = 1.0e9f;
+    constexpr std::int64_t SIGHT_VALID_SECONDS = 10;
+    // Places of the map are towers, farms and mills: big things that show from further away than a character does
+    constexpr float SIGHT_PLACE_TIMES = 3.0f;
+    std::mutex sightLock;
+    RE::FormID keptSightViewerID = 0;
+    float keptSightUnits = NO_SIGHT_LIMIT_UNITS;
+    std::chrono::steady_clock::time_point keptSightTime;
+
+    float GetSightUnitsOf(const RE::TESObjectREFR* viewer) {
+        if (!viewer) return NO_SIGHT_LIMIT_UNITS;
+        const std::lock_guard<std::mutex> guard(sightLock);
+        if (keptSightViewerID != viewer->GetFormID()) return NO_SIGHT_LIMIT_UNITS;
+        const auto age = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - keptSightTime).count();
+        return age <= SIGHT_VALID_SECONDS ? keptSightUnits : NO_SIGHT_LIMIT_UNITS;
+    }
+
     // Which sense tells a viewer of a character, or SENSE_NONE if it notices nothing of it. view and distanceUnits:
     // where the character is, seen from the viewer. halfAngleDegrees: how far to the left and right the viewer sees.
     // The dead make no sound. Only call this while the physics are locked for reading
     std::int32_t GetSenseOf(RE::bhkWorld* physics, float scale, const RE::NiPoint3& eyes, RE::Actor* actor, const View& view, float distanceUnits,
-                            std::int32_t halfAngleDegrees) {
+                            std::int32_t halfAngleDegrees, float sightUnits = NO_SIGHT_LIMIT_UNITS) {
         const bool isInFront = std::abs(view.angleDegrees) <= halfAngleDegrees;
         // Further away than anything can be heard, and not in front: no ray is needed to tell
         if (!isInFront && distanceUnits > HEAR_LOUD_UNITS) return SENSE_NONE;
         const bool isInSight = IsInSight(physics, scale, eyes, actor->GetPosition());
-        if (isInFront && isInSight) return SENSE_SEEN;
+        // Further away than the viewer sees in this weather and light, a character can still be heard
+        if (isInFront && isInSight && distanceUnits <= sightUnits) return SENSE_SEEN;
         if (distanceUnits <= CLOSE_UNITS) return SENSE_CLOSE;
         if (actor->IsDead()) return SENSE_NONE;
         const float reach = GetHearingUnits(actor) * (isInSight ? 1.0f : HEAR_BEHIND_WALL_PART);
@@ -2947,8 +2979,11 @@ namespace Companion {
         }
         if (halfAngleDegrees > NO_SIGHT_FILTER) {
             std::vector<Place> ahead;
+            const float placeSightMeters = GetSightUnitsOf(viewer) * SIGHT_PLACE_TIMES / GAME_UNITS_PER_METER;
             for (auto& place : places) {
-                if (std::abs(place.view.angleDegrees) <= halfAngleDegrees) ahead.push_back(std::move(place));
+                if (std::abs(place.view.angleDegrees) <= halfAngleDegrees && static_cast<float>(place.view.distanceMeters) <= placeSightMeters) {
+                    ahead.push_back(std::move(place));
+                }
             }
             places = std::move(ahead);
             // Without the physics of the game the walls cannot be checked: then it stays with the direction
@@ -3978,10 +4013,11 @@ namespace Companion {
             {
                 const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
                 const RE::NiPoint3 eyes(own.x, own.y, own.z + SIGHT_EYE_UNITS);
+                const float sightUnits = GetSightUnitsOf(viewer);
                 const RE::BSReadLockGuard guard(physics->worldLock);
                 for (auto& character : seen) {
                     character.sense = GetSenseOf(physics, scale, eyes, character.actor, GetViewFrom(viewer, character.actor->GetPosition()),
-                                                 character.distance, senseHalfAngleDegrees);
+                                                 character.distance, senseHalfAngleDegrees, sightUnits);
                 }
             }
             std::erase_if(seen, [](const SeenCharacter& character) { return character.sense == SENSE_NONE; });
@@ -4339,6 +4375,17 @@ namespace Companion {
     constexpr std::int32_t WEATHER_CLOUDY = 1;
     constexpr std::int32_t WEATHER_RAINY = 2;
     constexpr std::int32_t WEATHER_SNOW = 3;
+    // Fog is no kind of weather for the game: its fog weathers are marked as cloudy, and what only has clouds in the
+    // sky is marked as pleasant. They are told apart by how far the fog of the weather reaches by day (game units):
+    // marked cloudy and no further than WEATHER_FOG_FAR_UNITS is fog, no further than WEATHER_DENSE_FOG_FAR_UNITS is
+    // dense fog (SkyrimFog has 25000, RiftenOvercastFog and SkyrimOvercastWar have 9000, the weathers with clouds
+    // 50000 to 100000). Marked snow and no further than WEATHER_FOG_FAR_UNITS is a snowstorm (SkyrimStormSnow has
+    // 20000, SkyrimOvercastSnow 50000). A weather mod may bring other numbers
+    constexpr std::int32_t WEATHER_FOG = 4;
+    constexpr std::int32_t WEATHER_DENSE_FOG = 5;
+    constexpr std::int32_t WEATHER_SNOWSTORM = 6;
+    constexpr float WEATHER_FOG_FAR_UNITS = 30000.0f;
+    constexpr float WEATHER_DENSE_FOG_FAR_UNITS = 14000.0f;
     constexpr float MINUTES_PER_DAY = 24.0f * MINUTES_PER_HOUR;
     constexpr std::int32_t HORSE_NOT_LOADED = -1;
     constexpr std::string_view UNKNOWN_LOCATION_NAME = "Unknown";
@@ -4402,10 +4449,15 @@ namespace Companion {
         const auto* weather = sky ? sky->currentWeather : nullptr;
         if (!weather) return WEATHER_NOT_KNOWN;
         const auto& marks = weather->data.flags;
+        const float fogFar = weather->fogData.dayFar;
+        const bool isFoggy = fogFar > 0.0f && fogFar <= WEATHER_FOG_FAR_UNITS;
         if (marks.any(RE::TESWeather::WeatherDataFlag::kPleasant)) return WEATHER_PLEASANT;
-        if (marks.any(RE::TESWeather::WeatherDataFlag::kCloudy)) return WEATHER_CLOUDY;
+        if (marks.any(RE::TESWeather::WeatherDataFlag::kCloudy)) {
+            if (isFoggy) return fogFar <= WEATHER_DENSE_FOG_FAR_UNITS ? WEATHER_DENSE_FOG : WEATHER_FOG;
+            return WEATHER_CLOUDY;
+        }
         if (marks.any(RE::TESWeather::WeatherDataFlag::kRainy)) return WEATHER_RAINY;
-        if (marks.any(RE::TESWeather::WeatherDataFlag::kSnow)) return WEATHER_SNOW;
+        if (marks.any(RE::TESWeather::WeatherDataFlag::kSnow)) return isFoggy ? WEATHER_SNOWSTORM : WEATHER_SNOW;
         return WEATHER_NOT_KNOWN;
     }
 
@@ -4967,6 +5019,34 @@ namespace Companion {
     constexpr float VIEW_THING_HEIGHT_UNITS = 60.0f;
     constexpr float VIEW_THING_HALF_UNITS = 25.0f;
     constexpr float VIEW_NEAREST_UNITS = 1.0f;
+    // Whether something stands in front of a character or a thing is told by a ray from the eyes to a point of it.
+    // In a test an axe and a book behind the front of a counter were in the picture: the sight check for doors and
+    // places (IsInSight) looks at three heights above a position and takes what is within two meters of it for the
+    // thing itself, so rays over the counter into thin air counted as seeing the axe on the floor behind it.
+    // A thing is looked at as a whole, with one ray to this height above its position, and what the ray meets this
+    // close to that point counts as the thing: little for something loose, more for a chest, a seat or a door,
+    // which are solid themselves. A character is looked at row by row of the picture, at the height of its body in
+    // that row, never right at the edge of its box. One that is dead lies, so its box is low
+    constexpr float VIEW_ITEM_AIM_UNITS = 10.0f;
+    constexpr float VIEW_ITEM_NEAR_UNITS = 20.0f;
+    constexpr float VIEW_SOLID_AIM_UNITS = 30.0f;
+    constexpr float VIEW_SOLID_NEAR_UNITS = 50.0f;
+    constexpr float VIEW_DOOR_AIM_UNITS = 90.0f;
+    constexpr float VIEW_DOOR_NEAR_UNITS = 60.0f;
+    constexpr float VIEW_CREATURE_NEAR_UNITS = 30.0f;
+    constexpr float VIEW_BODY_EDGE_UNITS = 10.0f;
+    constexpr float VIEW_LYING_HEIGHT_UNITS = 40.0f;
+    // The rays of the picture may go through this many things that are no obstacle. In a test the companion sat on its
+    // horse and every ray that went down counted as a drop: the horse under it is many parts, the usual six were used
+    // up inside it, and a ray that met nothing on its way down counted as a drop. Such a ray tells nothing now
+    constexpr std::int32_t VIEW_RAY_PASSES = 24;
+    // Riding: the ground is where the hooves of the horse are, and the eyes are where the game says the head of the
+    // rider is, if that lies where the head of a rider can be: this close to the rider sideways and this far above
+    // the hooves. Otherwise the eyes count as this far above the hooves
+    constexpr float VIEW_RIDING_EYE_UNITS = 170.0f;
+    constexpr float VIEW_RIDING_EYE_LOWEST_UNITS = 100.0f;
+    constexpr float VIEW_RIDING_EYE_HIGHEST_UNITS = 260.0f;
+    constexpr float VIEW_RIDING_EYE_SIDE_UNITS = 100.0f;
     // What the numbers of a cell say: the ground, wall or ceiling the ray met, how many meters away along the ground,
     // whether it found a drop, and the two nearest characters or things in it (their place in the legend, counted
     // from 1, and their meters)
@@ -4974,6 +5054,17 @@ namespace Companion {
     constexpr std::int32_t VIEW_TERRAIN_GROUND = 1;
     constexpr std::int32_t VIEW_TERRAIN_WALL = 2;
     constexpr std::int32_t VIEW_TERRAIN_ROOF = 3;
+    // Water, as a try with two ways at once, so that a look in the game shows which of them works: the ray met
+    // something in the layer for water (see RayHit), or the ground it met lies below the height the cell gives for
+    // the water at that spot (RE::TESObjectCELL::GetWaterHeight, by its ID for Skyrim SE), or both. The meters are
+    // those to where the ray meets the surface of the water
+    constexpr std::int32_t VIEW_TERRAIN_WATER_BY_LAYER = 4;
+    constexpr std::int32_t VIEW_TERRAIN_WATER_BY_HEIGHT = 5;
+    constexpr std::int32_t VIEW_TERRAIN_WATER_BY_BOTH = 6;
+    constexpr std::uint64_t CELL_WATER_HEIGHT_ID = 18543;
+    constexpr float VIEW_WATER_DEPTH_UNITS = 5.0f;
+    constexpr float VIEW_WATER_LOWEST_HEIGHT = -1000000.0f;
+    constexpr float VIEW_WATER_HIGHEST_HEIGHT = 1000000.0f;
     constexpr std::size_t VIEW_ENTRIES_PER_CELL = 2;
     constexpr std::int32_t VIEW_VALUES_PER_CELL = 7;
     // What the numbers of the legend say: a character or a thing, the two halves of its ref ID, and for a character
@@ -5001,6 +5092,10 @@ namespace Companion {
         float heightUnits = 0.0f;
         float halfUnits = 0.0f;
         float groundUnits = 0.0f;
+        // For the ray that tells whether it can be seen: how high above its position the ray aims (things only), and
+        // how close to that point the ray may end
+        float aimUnits = 0.0f;
+        float nearUnits = 0.0f;
         std::string name;
     };
 
@@ -5029,6 +5124,15 @@ namespace Companion {
         }
     }
 
+    // Whether nothing solid of the world lies between the eyes and this point, or only within nearUnits of it.
+    // Only call this while the physics are locked for reading
+    bool IsViewPointSeen(RE::bhkWorld* physics, float scale, const RE::NiPoint3& eyes, const RE::NiPoint3& point, float nearUnits) {
+        const float length = (point - eyes).Length();
+        if (length <= nearUnits) return true;
+        const RayHit hit = CastRay(physics, scale, eyes, point, VIEW_RAY_PASSES);
+        return !hit.isHit || hit.distance >= length - nearUnits;
+    }
+
     // The picture in front of the companion as numbers: VIEW_FORMAT, columns, rows, degrees from left to right, how
     // many meters the rays reach, how many entries the legend has, how many numbers each entry and each cell has,
     // then the legend, then the cells row by row from the top, each row from left to right. The names of the legend
@@ -5038,16 +5142,38 @@ namespace Companion {
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!companion || !player || companion->IsDead() || !companion->Is3DLoaded()) return numbers;
         if (!HasGameAddress(CELL_PHYSICS_ID) || !HasGameAddress(PHYSICS_LOCK_ID) || !HasGameAddress(PHYSICS_UNLOCK_ID)) return numbers;
-        const auto* cell = companion->GetParentCell();
+        auto* cell = companion->GetParentCell();
         auto* physics = cell ? cell->GetbhkWorld() : nullptr;
         if (!physics) return numbers;
+        const bool canAskWater = HasGameAddress(CELL_WATER_HEIGHT_ID);
         columns = std::clamp(columns, VIEW_MIN_COLUMNS, VIEW_MAX_COLUMNS);
         rows = std::clamp(rows, VIEW_MIN_ROWS, VIEW_MAX_ROWS);
         degrees = std::clamp(degrees, VIEW_MIN_DEGREES, VIEW_MAX_DEGREES);
 
         const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
-        const RE::NiPoint3 feet = companion->GetPosition();
-        const RE::NiPoint3 eyes(feet.x, feet.y, feet.z + SIGHT_EYE_UNITS);
+        // On foot the ground is at the feet and the eyes are a fixed height above them. In the saddle the ground is
+        // at the hooves of the horse and the eyes are those of the rider (see VIEW_RIDING_EYE_UNITS)
+        const RE::NiPoint3 own = companion->GetPosition();
+        RE::NiPointer<RE::Actor> mount;
+        const bool isRiding = companion->GetMount(mount) && mount;
+        const RE::NiPoint3 feet(own.x, own.y, isRiding ? mount->GetPosition().z : own.z);
+        RE::NiPoint3 eyes(feet.x, feet.y, feet.z + (isRiding ? VIEW_RIDING_EYE_UNITS : SIGHT_EYE_UNITS));
+        if (isRiding) {
+            const RE::NiPoint3 head = companion->GetLookingAtLocation();
+            const float headEast = head.x - own.x;
+            const float headNorth = head.y - own.y;
+            const float headUp = head.z - feet.z;
+            if (std::sqrt(headEast * headEast + headNorth * headNorth) <= VIEW_RIDING_EYE_SIDE_UNITS && headUp >= VIEW_RIDING_EYE_LOWEST_UNITS &&
+                headUp <= VIEW_RIDING_EYE_HIGHEST_UNITS) {
+                eyes = head;
+            }
+        }
+        const RE::Actor* ownMount = isRiding ? mount.get() : nullptr;
+        // No further than the companion sees in this weather and light. The rays still go their whole way, so that
+        // they can tell a drop from ground that is only too far away to be seen
+        const float sightLimit = GetSightUnitsOf(companion);
+        const float rangeUnits = std::min(VIEW_RANGE_UNITS, sightLimit);
+        const float thingRangeUnits = std::min(VIEW_THING_RANGE_UNITS, sightLimit);
         const float heading = companion->GetAngleZ();
         const float columnAngle = static_cast<float>(degrees) / DEGREES_PER_RADIAN / static_cast<float>(columns);
         const float rowAngle = std::min(columnAngle, VIEW_MAX_HEIGHT_DEGREES / DEGREES_PER_RADIAN / static_cast<float>(rows));
@@ -5066,27 +5192,30 @@ namespace Companion {
             entry.feet = actor->GetPosition();
             entry.heightUnits = VIEW_CREATURE_HEIGHT_UNITS;
             entry.halfUnits = VIEW_CREATURE_HALF_UNITS;
+            entry.nearUnits = VIEW_CREATURE_NEAR_UNITS;
             entry.name = CleanText(ViewOf(actor->GetDisplayFullName()));
             if (actor == player) {
                 entry.flags = VIEW_CREATURE_PLAYER;
                 isPlayerListed = true;
             } else if (actor->IsDead()) {
                 entry.flags = VIEW_CREATURE_DEAD;
+                entry.heightUnits = VIEW_LYING_HEIGHT_UNITS;
             } else if (canTellHostile && actor->IsHostileToActor(player)) {
                 entry.flags = VIEW_CREATURE_HOSTILE;
             }
             creatures.push_back(std::move(entry));
         };
-        ForEachReferenceAround(companion, VIEW_RANGE_UNITS, [&](RE::TESObjectREFR* reference) {
+        ForEachReferenceAround(companion, rangeUnits, [&](RE::TESObjectREFR* reference) {
             if (!reference || reference == companion || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
                 return RE::BSContainer::ForEachResult::kContinue;
             }
             if (auto* actor = reference->As<RE::Actor>()) {
-                if (actor->Is3DLoaded()) addCreature(actor);
+                // The horse the companion sits on is not something it sees in front of it
+                if (actor != ownMount && actor->Is3DLoaded() && feet.GetDistance(actor->GetPosition()) <= rangeUnits) addCreature(actor);
                 return RE::BSContainer::ForEachResult::kContinue;
             }
             const auto* base = reference->GetBaseObject();
-            if (!base || feet.GetDistance(reference->GetPosition()) > VIEW_THING_RANGE_UNITS) return RE::BSContainer::ForEachResult::kContinue;
+            if (!base || feet.GetDistance(reference->GetPosition()) > thingRangeUnits) return RE::BSContainer::ForEachResult::kContinue;
             ViewEntry entry;
             entry.kind = VIEW_IS_THING;
             entry.heightUnits = VIEW_THING_HEIGHT_UNITS;
@@ -5096,18 +5225,23 @@ namespace Companion {
                 entry.flags = VIEW_THING_DOOR;
                 entry.heightUnits = VIEW_DOOR_HEIGHT_UNITS;
                 entry.halfUnits = VIEW_DOOR_HALF_UNITS;
+                entry.aimUnits = VIEW_DOOR_AIM_UNITS;
+                entry.nearUnits = VIEW_DOOR_NEAR_UNITS;
                 if (entry.name.empty()) entry.name = std::string(VIEW_DOOR_NAME);
             } else {
                 const std::int32_t thingKind = GetThingKind(base);
                 if (thingKind < 0 || entry.name.empty()) return RE::BSContainer::ForEachResult::kContinue;
                 entry.flags = thingKind == THING_IS_CONTAINER ? VIEW_THING_CONTAINER : (thingKind == THING_IS_FURNITURE ? VIEW_THING_FURNITURE : VIEW_THING_ITEM);
+                const bool isSolid = thingKind != THING_IS_ITEM;
+                entry.aimUnits = isSolid ? VIEW_SOLID_AIM_UNITS : VIEW_ITEM_AIM_UNITS;
+                entry.nearUnits = isSolid ? VIEW_SOLID_NEAR_UNITS : VIEW_ITEM_NEAR_UNITS;
             }
             entry.referenceID = reference->GetFormID();
             entry.feet = reference->GetPosition();
             things.push_back(std::move(entry));
             return RE::BSContainer::ForEachResult::kContinue;
         });
-        if (!isPlayerListed && player->Is3DLoaded() && feet.GetDistance(player->GetPosition()) <= VIEW_RANGE_UNITS) addCreature(player);
+        if (!isPlayerListed && player->Is3DLoaded() && feet.GetDistance(player->GetPosition()) <= rangeUnits) addCreature(player);
 
         std::vector<ViewCell> cells(static_cast<std::size_t>(columns) * static_cast<std::size_t>(rows));
         std::vector<ViewEntry> legend;
@@ -5120,16 +5254,51 @@ namespace Companion {
                     const float turn = heading + (static_cast<float>(column) + 0.5f - halfColumns) * columnAngle;
                     const RE::NiPoint3 direction(std::sin(turn) * std::cos(pitch), std::cos(turn) * std::cos(pitch), std::sin(pitch));
                     const RE::NiPoint3 start = eyes + direction * RAY_START_UNITS;
-                    const RayHit hit = CastRay(physics, scale, start, eyes + direction * VIEW_RANGE_UNITS);
+                    const RayHit hit = CastRay(physics, scale, start, eyes + direction * VIEW_RANGE_UNITS, VIEW_RAY_PASSES);
                     ViewCell& viewCell = cells[static_cast<std::size_t>(row) * static_cast<std::size_t>(columns) + static_cast<std::size_t>(column)];
                     if (!hit.isHit) {
-                        viewCell.isDrop = pitch < 0.0f ? 1 : 0;
+                        if (hit.waterDistance >= 0.0f) {
+                            // Water with nothing solid behind it within reach
+                            const RE::NiPoint3 farSurface = start + direction * hit.waterDistance;
+                            const float farEast = farSurface.x - feet.x;
+                            const float farNorth = farSurface.y - feet.y;
+                            const float farUnits = std::sqrt(farEast * farEast + farNorth * farNorth);
+                            if (farUnits > rangeUnits) continue;
+                            viewCell.terrain = VIEW_TERRAIN_WATER_BY_LAYER;
+                            viewCell.terrainMeters = ToWholeMeters(farUnits);
+                            continue;
+                        }
+                        // A ray that got through to its end on the way down has found a drop. One that was cut short tells nothing
+                        viewCell.isDrop = pitch < 0.0f && !hit.isCutShort ? 1 : 0;
                         continue;
                     }
                     const RE::NiPoint3 point = start + direction * hit.distance;
+                    // Water in front of what the ray met?
+                    const bool isWaterByLayer = hit.waterDistance >= 0.0f;
+                    RE::NiPoint3 surface = start + direction * (isWaterByLayer ? hit.waterDistance : 0.0f);
+                    bool isWaterByHeight = false;
+                    float waterHeight = 0.0f;
+                    if (canAskWater && pitch < 0.0f && cell->GetWaterHeight(point, waterHeight) && waterHeight > VIEW_WATER_LOWEST_HEIGHT &&
+                        waterHeight < VIEW_WATER_HIGHEST_HEIGHT && point.z < waterHeight - VIEW_WATER_DEPTH_UNITS && start.z > waterHeight) {
+                        isWaterByHeight = true;
+                        if (!isWaterByLayer) surface = start + direction * ((waterHeight - start.z) / direction.z);
+                    }
+                    if (isWaterByLayer || isWaterByHeight) {
+                        const float waterEast = surface.x - feet.x;
+                        const float waterNorth = surface.y - feet.y;
+                        const float waterUnits = std::sqrt(waterEast * waterEast + waterNorth * waterNorth);
+                        if (waterUnits > rangeUnits) continue;
+                        viewCell.terrain = isWaterByLayer && isWaterByHeight ? VIEW_TERRAIN_WATER_BY_BOTH
+                                                                             : (isWaterByLayer ? VIEW_TERRAIN_WATER_BY_LAYER : VIEW_TERRAIN_WATER_BY_HEIGHT);
+                        viewCell.terrainMeters = ToWholeMeters(waterUnits);
+                        continue;
+                    }
                     const float east = point.x - feet.x;
                     const float north = point.y - feet.y;
-                    viewCell.terrainMeters = ToWholeMeters(std::sqrt(east * east + north * north));
+                    const float groundUnits = std::sqrt(east * east + north * north);
+                    // Too far away to be seen: the cell stays empty, and it is no drop
+                    if (groundUnits > rangeUnits) continue;
+                    viewCell.terrainMeters = ToWholeMeters(groundUnits);
                     if (hit.normalUp > VIEW_GROUND_NORMAL) {
                         viewCell.terrain = VIEW_TERRAIN_GROUND;
                         viewCell.isDrop = pitch < 0.0f && point.z < feet.z - VIEW_DROP_UNITS ? 1 : 0;
@@ -5140,7 +5309,7 @@ namespace Companion {
                     }
                 }
             }
-            // The characters and things: into the cells their box covers, if nothing solid stands in front of them
+            // The characters and things: into the cells their box covers, as far as nothing solid stands in front of them
             const auto place = [&](std::vector<ViewEntry>& entries, std::size_t limit) {
                 for (ViewEntry& entry : entries) {
                     const float east = entry.feet.x - feet.x;
@@ -5161,11 +5330,24 @@ namespace Companion {
                     const auto firstRow = static_cast<std::int32_t>(std::floor((topAngle - highAngle) / rowAngle));
                     const auto lastRow = static_cast<std::int32_t>(std::floor((topAngle - lowAngle) / rowAngle));
                     if (lastColumn < 0 || firstColumn >= columns || lastRow < 0 || firstRow >= rows) continue;
-                    if (!IsInSight(physics, scale, eyes, entry.feet)) continue;
-                    legend.push_back(entry);
-                    ++taken;
-                    const auto legendNumber = static_cast<std::int32_t>(legend.size());
+                    const bool isThing = entry.kind == VIEW_IS_THING;
+                    if (isThing && !IsViewPointSeen(physics, scale, eyes, RE::NiPoint3(entry.feet.x, entry.feet.y, entry.feet.z + entry.aimUnits), entry.nearUnits)) {
+                        continue;
+                    }
+                    std::int32_t legendNumber = 0;
                     for (std::int32_t row = std::max(firstRow, 0); row <= std::min(lastRow, rows - 1); ++row) {
+                        if (!isThing) {
+                            // The height of the body in this row of the picture
+                            const float rowPitch = topAngle - (static_cast<float>(row) + 0.5f) * rowAngle;
+                            const float bodyHeight = std::clamp(eyes.z + std::tan(rowPitch) * entry.groundUnits, entry.feet.z + VIEW_BODY_EDGE_UNITS,
+                                                                entry.feet.z + entry.heightUnits - VIEW_BODY_EDGE_UNITS);
+                            if (!IsViewPointSeen(physics, scale, eyes, RE::NiPoint3(entry.feet.x, entry.feet.y, bodyHeight), entry.nearUnits)) continue;
+                        }
+                        if (legendNumber == 0) {
+                            legend.push_back(entry);
+                            ++taken;
+                            legendNumber = static_cast<std::int32_t>(legend.size());
+                        }
                         for (std::int32_t column = std::max(firstColumn, 0); column <= std::min(lastColumn, columns - 1); ++column) {
                             AddToViewCell(cells[static_cast<std::size_t>(row) * static_cast<std::size_t>(columns) + static_cast<std::size_t>(column)], legendNumber,
                                           entry.groundUnits);
@@ -5178,7 +5360,7 @@ namespace Companion {
         }
 
         std::vector<std::string> names;
-        numbers = {VIEW_FORMAT, columns, rows, degrees, VIEW_RANGE_METERS, static_cast<std::int32_t>(legend.size()), VIEW_VALUES_PER_LEGEND, VIEW_VALUES_PER_CELL};
+        numbers = {VIEW_FORMAT, columns, rows, degrees, ToWholeMeters(rangeUnits), static_cast<std::int32_t>(legend.size()), VIEW_VALUES_PER_LEGEND, VIEW_VALUES_PER_CELL};
         for (const ViewEntry& entry : legend) {
             numbers.push_back(entry.kind);
             numbers.push_back(static_cast<std::int32_t>((entry.referenceID >> VIEW_HALF_BITS) & VIEW_HALF_MASK));
@@ -5206,6 +5388,134 @@ namespace Companion {
     std::vector<std::string> GetViewNames(RE::StaticFunctionTag*) {
         const std::lock_guard<std::mutex> guard(viewLock);
         return viewNames;
+    }
+
+    // ------------------------------------------------------------------ sight
+    // How far a character sees: outdoors by the weather and the time of day, indoors by the light where it stands.
+    // The meters are what the player of the mod chose after looking at pictures of the weathers of the game.
+    // A torch does not make the sight longer than this, it only keeps it from getting shorter than SIGHT_TORCH_METERS
+
+    constexpr float SIGHT_CLEAR_METERS = 200.0f;
+    constexpr float SIGHT_RAIN_METERS = 100.0f;
+    constexpr float SIGHT_SNOW_METERS = 100.0f;
+    constexpr float SIGHT_FOG_METERS = 50.0f;
+    constexpr float SIGHT_SNOWSTORM_METERS = 50.0f;
+    constexpr float SIGHT_DENSE_FOG_METERS = 25.0f;
+    // The time of day as a part of that, in percent: all of it by day, down to half through the evening, down to a
+    // quarter until one o'clock, a quarter until four, and back up to all of it through the morning
+    constexpr float SIGHT_DAY_START_HOUR = 7.0f;
+    constexpr float SIGHT_DAY_END_HOUR = 18.0f;
+    constexpr float SIGHT_EVENING_END_HOUR = 21.0f;
+    constexpr float SIGHT_DEEP_NIGHT_START_HOUR = 1.0f;
+    constexpr float SIGHT_DEEP_NIGHT_END_HOUR = 4.0f;
+    constexpr float SIGHT_FULL_PERCENT = 100.0f;
+    constexpr float SIGHT_EVENING_PERCENT = 50.0f;
+    constexpr float SIGHT_NIGHT_PERCENT = 25.0f;
+    constexpr float HOURS_PER_DAY = 24.0f;
+    // Indoors: the light level the game tells for where a character stands (Actor.GetLightLevel of a script, 0 to
+    // 150). NOT MEASURED YET: where bright ends and dark begins has to be read off in the game and set here
+    constexpr std::int32_t SIGHT_BRIGHT_LIGHT = 60;
+    constexpr std::int32_t SIGHT_DIM_LIGHT = 20;
+    constexpr float SIGHT_BRIGHT_METERS = 50.0f;
+    constexpr float SIGHT_DIM_METERS = 25.0f;
+    constexpr float SIGHT_DARK_METERS = 8.0f;
+    constexpr std::int32_t SIGHT_LIGHT_NOT_USED = 0;
+    constexpr std::int32_t SIGHT_LIGHT_BRIGHT = 1;
+    constexpr std::int32_t SIGHT_LIGHT_DIM = 2;
+    constexpr std::int32_t SIGHT_LIGHT_DARK = 3;
+    // A torch in the hand of the viewer, or of the player if the player is this close to the viewer
+    constexpr float SIGHT_TORCH_METERS = 20.0f;
+    constexpr float SIGHT_TORCH_NEAR_UNITS = 15.0f * GAME_UNITS_PER_METER;
+
+    // Which part of the sight is left at this time of day, in percent (see SIGHT_DAY_START_HOUR and the lines after it)
+    float GetSightTimePercent(std::int32_t minutesOfDay) {
+        const float hour = static_cast<float>(minutesOfDay) / MINUTES_PER_HOUR;
+        if (hour >= SIGHT_DAY_START_HOUR && hour < SIGHT_DAY_END_HOUR) return SIGHT_FULL_PERCENT;
+        if (hour >= SIGHT_DAY_END_HOUR && hour < SIGHT_EVENING_END_HOUR) {
+            return SIGHT_FULL_PERCENT - (hour - SIGHT_DAY_END_HOUR) / (SIGHT_EVENING_END_HOUR - SIGHT_DAY_END_HOUR) * (SIGHT_FULL_PERCENT - SIGHT_EVENING_PERCENT);
+        }
+        if (hour >= SIGHT_DEEP_NIGHT_START_HOUR && hour < SIGHT_DEEP_NIGHT_END_HOUR) return SIGHT_NIGHT_PERCENT;
+        if (hour >= SIGHT_DEEP_NIGHT_END_HOUR && hour < SIGHT_DAY_START_HOUR) {
+            return SIGHT_NIGHT_PERCENT + (hour - SIGHT_DEEP_NIGHT_END_HOUR) / (SIGHT_DAY_START_HOUR - SIGHT_DEEP_NIGHT_END_HOUR) * (SIGHT_FULL_PERCENT - SIGHT_NIGHT_PERCENT);
+        }
+        // From the end of the evening over midnight to the deep of the night
+        const float sinceEvening = hour >= SIGHT_EVENING_END_HOUR ? hour - SIGHT_EVENING_END_HOUR : hour + HOURS_PER_DAY - SIGHT_EVENING_END_HOUR;
+        const float untilDeepNight = SIGHT_DEEP_NIGHT_START_HOUR + HOURS_PER_DAY - SIGHT_EVENING_END_HOUR;
+        return SIGHT_EVENING_PERCENT - sinceEvening / untilDeepNight * (SIGHT_EVENING_PERCENT - SIGHT_NIGHT_PERCENT);
+    }
+
+    bool HoldsTorch(RE::Actor* holder) {
+        const RE::TESForm* rightHand = holder->GetEquippedObject(false);
+        const RE::TESForm* leftHand = holder->GetEquippedObject(true);
+        return (leftHand && leftHand->Is(RE::FormType::Light)) || (rightHand && rightHand->Is(RE::FormType::Light));
+    }
+
+    // Works out how far the viewer sees right now and keeps it for what looks next (see GetSightUnitsOf).
+    // lightLevel: what Actor.GetLightLevel told the script for the viewer, below 0 if it could not tell.
+    // Returns: the meters, the weather (WEATHER_...), the part the time of day leaves in percent, indoors or not,
+    // the light (SIGHT_LIGHT_...), whether a torch keeps the sight from being shorter, the light level, and the
+    // time of day in minutes since midnight
+    std::vector<std::int32_t> UpdateSight(RE::StaticFunctionTag*, RE::Actor* viewer, std::int32_t lightLevel) {
+        std::vector<std::int32_t> numbers;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!viewer || !player) return numbers;
+        const auto* cell = viewer->GetParentCell();
+        const bool isIndoors = cell && cell->IsInteriorCell();
+        const std::int32_t minutesOfDay = GetMinutesOfDay();
+        std::int32_t weather = WEATHER_NOT_KNOWN;
+        float timePercent = SIGHT_FULL_PERCENT;
+        std::int32_t light = SIGHT_LIGHT_NOT_USED;
+        float meters = SIGHT_CLEAR_METERS;
+        if (isIndoors) {
+            if (lightLevel < 0 || lightLevel >= SIGHT_BRIGHT_LIGHT) {
+                light = SIGHT_LIGHT_BRIGHT;
+                meters = SIGHT_BRIGHT_METERS;
+            } else if (lightLevel >= SIGHT_DIM_LIGHT) {
+                light = SIGHT_LIGHT_DIM;
+                meters = SIGHT_DIM_METERS;
+            } else {
+                light = SIGHT_LIGHT_DARK;
+                meters = SIGHT_DARK_METERS;
+            }
+        } else {
+            weather = GetWeatherClass();
+            switch (weather) {
+                case WEATHER_RAINY:
+                    meters = SIGHT_RAIN_METERS;
+                    break;
+                case WEATHER_SNOW:
+                    meters = SIGHT_SNOW_METERS;
+                    break;
+                case WEATHER_FOG:
+                    meters = SIGHT_FOG_METERS;
+                    break;
+                case WEATHER_SNOWSTORM:
+                    meters = SIGHT_SNOWSTORM_METERS;
+                    break;
+                case WEATHER_DENSE_FOG:
+                    meters = SIGHT_DENSE_FOG_METERS;
+                    break;
+                default:
+                    meters = SIGHT_CLEAR_METERS;
+                    break;
+            }
+            timePercent = GetSightTimePercent(minutesOfDay);
+            meters = meters * timePercent / SIGHT_FULL_PERCENT;
+        }
+        const bool hasTorch = HoldsTorch(viewer) ||
+                              (viewer != player && viewer->GetPosition().GetDistance(player->GetPosition()) <= SIGHT_TORCH_NEAR_UNITS && HoldsTorch(player));
+        const bool isTorchUsed = hasTorch && meters < SIGHT_TORCH_METERS;
+        if (isTorchUsed) meters = SIGHT_TORCH_METERS;
+        meters = std::max(meters, 1.0f);
+        {
+            const std::lock_guard<std::mutex> guard(sightLock);
+            keptSightViewerID = viewer->GetFormID();
+            keptSightUnits = meters * GAME_UNITS_PER_METER;
+            keptSightTime = std::chrono::steady_clock::now();
+        }
+        numbers = {static_cast<std::int32_t>(std::lround(meters)), weather, static_cast<std::int32_t>(std::lround(timePercent)), isIndoors ? 1 : 0, light,
+                   isTorchUsed ? 1 : 0, lightLevel, minutesOfDay};
+        return numbers;
     }
 
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
@@ -5263,6 +5573,7 @@ namespace Companion {
         vm->RegisterFunction("GetCoverThreat", SCRIPT_NAME, GetCoverThreat);
         vm->RegisterFunction("GetView", SCRIPT_NAME, GetView);
         vm->RegisterFunction("GetViewNames", SCRIPT_NAME, GetViewNames);
+        vm->RegisterFunction("UpdateSight", SCRIPT_NAME, UpdateSight);
         return true;
     }
 
