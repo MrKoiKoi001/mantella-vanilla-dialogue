@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 32;
+    constexpr std::int32_t INTERFACE_VERSION = 33;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -4427,11 +4427,16 @@ namespace Companion {
         return reference ? reference->As<RE::Actor>() : nullptr;
     }
 
-    // The name of the place the player is in, as the script found it before: the location, or else the cell,
-    // or else the world
+    // The name of the place the player is in: the location, or else the cell, or else the world. Indoors the name of
+    // the cell comes first, with the location behind it: in a test the state only said "Helgen" inside Helgen Keep,
+    // because the location of a town also holds for the buildings in it. The game has no names for single rooms
     std::string GetLocationNameOf(const RE::Actor* player) {
         std::string name;
         if (const auto* location = player->GetCurrentLocation()) name = CleanText(ViewOf(location->GetName()));
+        if (const auto* indoorCell = player->GetParentCell(); indoorCell && indoorCell->IsInteriorCell()) {
+            const std::string room = CleanText(ViewOf(indoorCell->GetFullName()));
+            if (!room.empty() && !EqualsIgnoreCase(room, name)) name = name.empty() ? room : room + ", " + name;
+        }
         if (name.empty()) {
             if (const auto* cell = player->GetParentCell()) name = CleanText(ViewOf(cell->GetName()));
         }
