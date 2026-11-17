@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 27;
+    constexpr std::int32_t INTERFACE_VERSION = 28;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -4931,6 +4931,283 @@ namespace Companion {
         return "";
     }
 
+    // ------------------------------------------------------------------- view
+    // view: what lies in front of the companion as a grid of cells, like a very coarse picture. One ray goes through
+    // the middle of every cell, from the eyes of the companion, and tells what ground, wall or ceiling it meets and how
+    // far away that is. Characters and things do not come from the rays: the plugin knows where they are, works out
+    // which cells their outline (a box) falls into and looks whether something solid stands in front of them.
+    // The plugin only hands out numbers and names. The companion server makes the lines of the picture from them
+    // (see describe_view in state_text.py of the Mantella fork), so their form can change without a new plugin
+
+    constexpr std::int32_t VIEW_FORMAT = 1;
+    constexpr std::int32_t VIEW_MIN_COLUMNS = 4;
+    constexpr std::int32_t VIEW_MAX_COLUMNS = 32;
+    constexpr std::int32_t VIEW_MIN_ROWS = 3;
+    constexpr std::int32_t VIEW_MAX_ROWS = 18;
+    constexpr std::int32_t VIEW_MIN_DEGREES = 30;
+    constexpr std::int32_t VIEW_MAX_DEGREES = 180;
+    constexpr std::int32_t VIEW_RANGE_METERS = 80;
+    constexpr float VIEW_RANGE_UNITS = static_cast<float>(VIEW_RANGE_METERS) * GAME_UNITS_PER_METER;
+    constexpr float VIEW_THING_RANGE_UNITS = 25.0f * GAME_UNITS_PER_METER;
+    // A cell is as high as it is wide. This part of the height of the picture lies above the level of the eyes,
+    // the rest below, so that the ground in front of the feet is in it. The picture never reaches straight up or down
+    constexpr float VIEW_PART_ABOVE = 0.4f;
+    constexpr float VIEW_MAX_HEIGHT_DEGREES = 170.0f;
+    // A surface that faces up this much is ground, one that faces down this much is a ceiling, the rest is wall
+    constexpr float VIEW_GROUND_NORMAL = 0.6f;
+    // A ray that goes down and meets nothing, or ground this far below the feet, has found a drop
+    constexpr float VIEW_DROP_UNITS = 2.0f * GAME_UNITS_PER_METER;
+    constexpr std::size_t VIEW_MAX_CREATURES = 20;
+    constexpr std::size_t VIEW_MAX_THINGS = 20;
+    // The boxes: how high and half as wide a character, a door and any other thing counts
+    constexpr float VIEW_CREATURE_HEIGHT_UNITS = 130.0f;
+    constexpr float VIEW_CREATURE_HALF_UNITS = 35.0f;
+    constexpr float VIEW_DOOR_HEIGHT_UNITS = 180.0f;
+    constexpr float VIEW_DOOR_HALF_UNITS = 55.0f;
+    constexpr float VIEW_THING_HEIGHT_UNITS = 60.0f;
+    constexpr float VIEW_THING_HALF_UNITS = 25.0f;
+    constexpr float VIEW_NEAREST_UNITS = 1.0f;
+    // What the numbers of a cell say: the ground, wall or ceiling the ray met, how many meters away along the ground,
+    // whether it found a drop, and the two nearest characters or things in it (their place in the legend, counted
+    // from 1, and their meters)
+    constexpr std::int32_t VIEW_TERRAIN_NONE = 0;
+    constexpr std::int32_t VIEW_TERRAIN_GROUND = 1;
+    constexpr std::int32_t VIEW_TERRAIN_WALL = 2;
+    constexpr std::int32_t VIEW_TERRAIN_ROOF = 3;
+    constexpr std::size_t VIEW_ENTRIES_PER_CELL = 2;
+    constexpr std::int32_t VIEW_VALUES_PER_CELL = 7;
+    // What the numbers of the legend say: a character or a thing, the two halves of its ref ID, and for a character
+    // whether it is hostile, dead or the player, for a thing which kind it is
+    constexpr std::int32_t VIEW_VALUES_PER_LEGEND = 4;
+    constexpr std::int32_t VIEW_IS_CREATURE = 1;
+    constexpr std::int32_t VIEW_IS_THING = 2;
+    constexpr std::int32_t VIEW_CREATURE_HOSTILE = 1;
+    constexpr std::int32_t VIEW_CREATURE_DEAD = 2;
+    constexpr std::int32_t VIEW_CREATURE_PLAYER = 4;
+    constexpr std::int32_t VIEW_THING_DOOR = 1;
+    constexpr std::int32_t VIEW_THING_CONTAINER = 2;
+    constexpr std::int32_t VIEW_THING_FURNITURE = 3;
+    constexpr std::int32_t VIEW_THING_ITEM = 4;
+    constexpr std::uint32_t VIEW_HALF_BITS = 16;
+    constexpr std::uint32_t VIEW_HALF_MASK = 0xFFFF;
+    constexpr std::string_view VIEW_DOOR_NAME = "Door";
+    constexpr std::string_view VIEW_NO_NAME = "unreadable";
+
+    struct ViewEntry {
+        std::int32_t kind = VIEW_IS_CREATURE;
+        RE::FormID referenceID = 0;
+        std::int32_t flags = 0;
+        RE::NiPoint3 feet;
+        float heightUnits = 0.0f;
+        float halfUnits = 0.0f;
+        float groundUnits = 0.0f;
+        std::string name;
+    };
+
+    struct ViewCell {
+        std::int32_t terrain = VIEW_TERRAIN_NONE;
+        std::int32_t terrainMeters = 0;
+        std::int32_t isDrop = 0;
+        std::array<std::int32_t, VIEW_ENTRIES_PER_CELL> entries = {0, 0};
+        std::array<float, VIEW_ENTRIES_PER_CELL> entryUnits = {0.0f, 0.0f};
+    };
+
+    std::mutex viewLock;
+    std::vector<std::string> viewNames;
+
+    // Puts an entry of the legend into a cell, which keeps the nearest ones, the nearest first
+    void AddToViewCell(ViewCell& cell, std::int32_t legendNumber, float groundUnits) {
+        for (std::size_t place = 0; place < VIEW_ENTRIES_PER_CELL; ++place) {
+            if (cell.entries[place] != 0 && cell.entryUnits[place] <= groundUnits) continue;
+            for (std::size_t moved = VIEW_ENTRIES_PER_CELL - 1; moved > place; --moved) {
+                cell.entries[moved] = cell.entries[moved - 1];
+                cell.entryUnits[moved] = cell.entryUnits[moved - 1];
+            }
+            cell.entries[place] = legendNumber;
+            cell.entryUnits[place] = groundUnits;
+            return;
+        }
+    }
+
+    // The picture in front of the companion as numbers: VIEW_FORMAT, columns, rows, degrees from left to right, how
+    // many meters the rays reach, how many entries the legend has, how many numbers each entry and each cell has,
+    // then the legend, then the cells row by row from the top, each row from left to right. The names of the legend
+    // come from GetViewNames. An empty list if the plugin cannot look
+    std::vector<std::int32_t> GetView(RE::StaticFunctionTag*, RE::Actor* companion, std::int32_t columns, std::int32_t rows, std::int32_t degrees) {
+        std::vector<std::int32_t> numbers;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!companion || !player || companion->IsDead() || !companion->Is3DLoaded()) return numbers;
+        if (!HasGameAddress(CELL_PHYSICS_ID) || !HasGameAddress(PHYSICS_LOCK_ID) || !HasGameAddress(PHYSICS_UNLOCK_ID)) return numbers;
+        const auto* cell = companion->GetParentCell();
+        auto* physics = cell ? cell->GetbhkWorld() : nullptr;
+        if (!physics) return numbers;
+        columns = std::clamp(columns, VIEW_MIN_COLUMNS, VIEW_MAX_COLUMNS);
+        rows = std::clamp(rows, VIEW_MIN_ROWS, VIEW_MAX_ROWS);
+        degrees = std::clamp(degrees, VIEW_MIN_DEGREES, VIEW_MAX_DEGREES);
+
+        const float scale = HasGameAddress(PHYSICS_SCALE_ID) ? RE::bhkWorld::GetWorldScale() : DEFAULT_PHYSICS_SCALE;
+        const RE::NiPoint3 feet = companion->GetPosition();
+        const RE::NiPoint3 eyes(feet.x, feet.y, feet.z + SIGHT_EYE_UNITS);
+        const float heading = companion->GetAngleZ();
+        const float columnAngle = static_cast<float>(degrees) / DEGREES_PER_RADIAN / static_cast<float>(columns);
+        const float rowAngle = std::min(columnAngle, VIEW_MAX_HEIGHT_DEGREES / DEGREES_PER_RADIAN / static_cast<float>(rows));
+        const float topAngle = static_cast<float>(rows) * rowAngle * VIEW_PART_ABOVE;
+        const float halfColumns = static_cast<float>(columns) * 0.5f;
+
+        // The characters and things around, the nearest first
+        std::vector<ViewEntry> creatures;
+        std::vector<ViewEntry> things;
+        const bool canTellHostile = HasGameAddress(HOSTILE_TO_ACTOR_ID);
+        bool isPlayerListed = false;
+        const auto addCreature = [&](RE::Actor* actor) {
+            ViewEntry entry;
+            entry.kind = VIEW_IS_CREATURE;
+            entry.referenceID = actor->GetFormID();
+            entry.feet = actor->GetPosition();
+            entry.heightUnits = VIEW_CREATURE_HEIGHT_UNITS;
+            entry.halfUnits = VIEW_CREATURE_HALF_UNITS;
+            entry.name = CleanText(ViewOf(actor->GetDisplayFullName()));
+            if (actor == player) {
+                entry.flags = VIEW_CREATURE_PLAYER;
+                isPlayerListed = true;
+            } else if (actor->IsDead()) {
+                entry.flags = VIEW_CREATURE_DEAD;
+            } else if (canTellHostile && actor->IsHostileToActor(player)) {
+                entry.flags = VIEW_CREATURE_HOSTILE;
+            }
+            creatures.push_back(std::move(entry));
+        };
+        ForEachReferenceAround(companion, VIEW_RANGE_UNITS, [&](RE::TESObjectREFR* reference) {
+            if (!reference || reference == companion || reference->IsDisabled() || reference->IsMarkedForDeletion()) {
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            if (auto* actor = reference->As<RE::Actor>()) {
+                if (actor->Is3DLoaded()) addCreature(actor);
+                return RE::BSContainer::ForEachResult::kContinue;
+            }
+            const auto* base = reference->GetBaseObject();
+            if (!base || feet.GetDistance(reference->GetPosition()) > VIEW_THING_RANGE_UNITS) return RE::BSContainer::ForEachResult::kContinue;
+            ViewEntry entry;
+            entry.kind = VIEW_IS_THING;
+            entry.heightUnits = VIEW_THING_HEIGHT_UNITS;
+            entry.halfUnits = VIEW_THING_HALF_UNITS;
+            entry.name = CleanText(ViewOf(reference->GetDisplayFullName()));
+            if (base->Is(RE::FormType::Door)) {
+                entry.flags = VIEW_THING_DOOR;
+                entry.heightUnits = VIEW_DOOR_HEIGHT_UNITS;
+                entry.halfUnits = VIEW_DOOR_HALF_UNITS;
+                if (entry.name.empty()) entry.name = std::string(VIEW_DOOR_NAME);
+            } else {
+                const std::int32_t thingKind = GetThingKind(base);
+                if (thingKind < 0 || entry.name.empty()) return RE::BSContainer::ForEachResult::kContinue;
+                entry.flags = thingKind == THING_IS_CONTAINER ? VIEW_THING_CONTAINER : (thingKind == THING_IS_FURNITURE ? VIEW_THING_FURNITURE : VIEW_THING_ITEM);
+            }
+            entry.referenceID = reference->GetFormID();
+            entry.feet = reference->GetPosition();
+            things.push_back(std::move(entry));
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        if (!isPlayerListed && player->Is3DLoaded() && feet.GetDistance(player->GetPosition()) <= VIEW_RANGE_UNITS) addCreature(player);
+
+        std::vector<ViewCell> cells(static_cast<std::size_t>(columns) * static_cast<std::size_t>(rows));
+        std::vector<ViewEntry> legend;
+        {
+            const RE::BSReadLockGuard guard(physics->worldLock);
+            // The rays: one through the middle of every cell
+            for (std::int32_t row = 0; row < rows; ++row) {
+                const float pitch = topAngle - (static_cast<float>(row) + 0.5f) * rowAngle;
+                for (std::int32_t column = 0; column < columns; ++column) {
+                    const float turn = heading + (static_cast<float>(column) + 0.5f - halfColumns) * columnAngle;
+                    const RE::NiPoint3 direction(std::sin(turn) * std::cos(pitch), std::cos(turn) * std::cos(pitch), std::sin(pitch));
+                    const RE::NiPoint3 start = eyes + direction * RAY_START_UNITS;
+                    const RayHit hit = CastRay(physics, scale, start, eyes + direction * VIEW_RANGE_UNITS);
+                    ViewCell& viewCell = cells[static_cast<std::size_t>(row) * static_cast<std::size_t>(columns) + static_cast<std::size_t>(column)];
+                    if (!hit.isHit) {
+                        viewCell.isDrop = pitch < 0.0f ? 1 : 0;
+                        continue;
+                    }
+                    const RE::NiPoint3 point = start + direction * hit.distance;
+                    const float east = point.x - feet.x;
+                    const float north = point.y - feet.y;
+                    viewCell.terrainMeters = ToWholeMeters(std::sqrt(east * east + north * north));
+                    if (hit.normalUp > VIEW_GROUND_NORMAL) {
+                        viewCell.terrain = VIEW_TERRAIN_GROUND;
+                        viewCell.isDrop = pitch < 0.0f && point.z < feet.z - VIEW_DROP_UNITS ? 1 : 0;
+                    } else if (hit.normalUp < -VIEW_GROUND_NORMAL) {
+                        viewCell.terrain = VIEW_TERRAIN_ROOF;
+                    } else {
+                        viewCell.terrain = VIEW_TERRAIN_WALL;
+                    }
+                }
+            }
+            // The characters and things: into the cells their box covers, if nothing solid stands in front of them
+            const auto place = [&](std::vector<ViewEntry>& entries, std::size_t limit) {
+                for (ViewEntry& entry : entries) {
+                    const float east = entry.feet.x - feet.x;
+                    const float north = entry.feet.y - feet.y;
+                    entry.groundUnits = std::sqrt(east * east + north * north);
+                }
+                std::sort(entries.begin(), entries.end(), [](const ViewEntry& left, const ViewEntry& right) { return left.groundUnits < right.groundUnits; });
+                std::size_t taken = 0;
+                for (const ViewEntry& entry : entries) {
+                    if (taken >= limit) break;
+                    if (entry.groundUnits < VIEW_NEAREST_UNITS) continue;
+                    const float side = std::remainder(std::atan2(entry.feet.x - feet.x, entry.feet.y - feet.y) - heading, 2.0f * std::numbers::pi_v<float>);
+                    const float halfAngle = std::atan(entry.halfUnits / entry.groundUnits);
+                    const auto firstColumn = static_cast<std::int32_t>(std::floor((side - halfAngle) / columnAngle + halfColumns));
+                    const auto lastColumn = static_cast<std::int32_t>(std::floor((side + halfAngle) / columnAngle + halfColumns));
+                    const float lowAngle = std::atan2(entry.feet.z - eyes.z, entry.groundUnits);
+                    const float highAngle = std::atan2(entry.feet.z + entry.heightUnits - eyes.z, entry.groundUnits);
+                    const auto firstRow = static_cast<std::int32_t>(std::floor((topAngle - highAngle) / rowAngle));
+                    const auto lastRow = static_cast<std::int32_t>(std::floor((topAngle - lowAngle) / rowAngle));
+                    if (lastColumn < 0 || firstColumn >= columns || lastRow < 0 || firstRow >= rows) continue;
+                    if (!IsInSight(physics, scale, eyes, entry.feet)) continue;
+                    legend.push_back(entry);
+                    ++taken;
+                    const auto legendNumber = static_cast<std::int32_t>(legend.size());
+                    for (std::int32_t row = std::max(firstRow, 0); row <= std::min(lastRow, rows - 1); ++row) {
+                        for (std::int32_t column = std::max(firstColumn, 0); column <= std::min(lastColumn, columns - 1); ++column) {
+                            AddToViewCell(cells[static_cast<std::size_t>(row) * static_cast<std::size_t>(columns) + static_cast<std::size_t>(column)], legendNumber,
+                                          entry.groundUnits);
+                        }
+                    }
+                }
+            };
+            place(creatures, VIEW_MAX_CREATURES);
+            place(things, VIEW_MAX_THINGS);
+        }
+
+        std::vector<std::string> names;
+        numbers = {VIEW_FORMAT, columns, rows, degrees, VIEW_RANGE_METERS, static_cast<std::int32_t>(legend.size()), VIEW_VALUES_PER_LEGEND, VIEW_VALUES_PER_CELL};
+        for (const ViewEntry& entry : legend) {
+            numbers.push_back(entry.kind);
+            numbers.push_back(static_cast<std::int32_t>((entry.referenceID >> VIEW_HALF_BITS) & VIEW_HALF_MASK));
+            numbers.push_back(static_cast<std::int32_t>(entry.referenceID & VIEW_HALF_MASK));
+            numbers.push_back(entry.flags);
+            names.push_back(!entry.name.empty() && IsValidUtf(entry.name) ? entry.name : std::string(VIEW_NO_NAME));
+        }
+        for (const ViewCell& viewCell : cells) {
+            numbers.push_back(viewCell.terrain);
+            numbers.push_back(viewCell.terrainMeters);
+            numbers.push_back(viewCell.isDrop);
+            for (std::size_t place = 0; place < VIEW_ENTRIES_PER_CELL; ++place) {
+                numbers.push_back(viewCell.entries[place]);
+                numbers.push_back(viewCell.entries[place] != 0 ? ToWholeMeters(viewCell.entryUnits[place]) : 0);
+            }
+        }
+        {
+            const std::lock_guard<std::mutex> guard(viewLock);
+            viewNames = std::move(names);
+        }
+        return numbers;
+    }
+
+    // The names that belong to the legend GetView returned last, in its order
+    std::vector<std::string> GetViewNames(RE::StaticFunctionTag*) {
+        const std::lock_guard<std::mutex> guard(viewLock);
+        return viewNames;
+    }
+
     bool Bind(RE::BSScript::IVirtualMachine* vm) {
         vm->RegisterFunction("GetInterfaceVersion", SCRIPT_NAME, GetInterfaceVersion);
         vm->RegisterFunction("GetOpenQuests", SCRIPT_NAME, GetOpenQuests);
@@ -4984,6 +5261,8 @@ namespace Companion {
         vm->RegisterFunction("RequestCover", SCRIPT_NAME, RequestCover);
         vm->RegisterFunction("TakeCoverResult", SCRIPT_NAME, TakeCoverResult);
         vm->RegisterFunction("GetCoverThreat", SCRIPT_NAME, GetCoverThreat);
+        vm->RegisterFunction("GetView", SCRIPT_NAME, GetView);
+        vm->RegisterFunction("GetViewNames", SCRIPT_NAME, GetViewNames);
         return true;
     }
 
