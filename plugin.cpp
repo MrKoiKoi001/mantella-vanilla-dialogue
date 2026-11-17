@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 33;
+    constexpr std::int32_t INTERFACE_VERSION = 35;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -588,6 +588,8 @@ namespace Companion {
         std::int32_t distanceMeters = 0;
         // Negative = to the left of where the viewer faces, positive = to the right
         std::int32_t angleDegrees = 0;
+        // How far the point lies above where the game has the viewer, in game units (negative = below)
+        float upUnits = 0.0f;
     };
 
     View GetViewFrom(const RE::TESObjectREFR* viewer, const RE::NiPoint3& point) {
@@ -601,6 +603,7 @@ namespace Companion {
         View view;
         view.distanceMeters = static_cast<std::int32_t>(std::lround(std::sqrt(east * east + north * north + up * up) / GAME_UNITS_PER_METER));
         view.angleDegrees = static_cast<std::int32_t>(std::lround(std::remainder(direction - facing, FULL_CIRCLE_DEGREES)));
+        view.upUnits = up;
         return view;
     }
 
@@ -1302,6 +1305,61 @@ namespace Companion {
     }
 
     std::int32_t ToWholeMeters(float gameUnits) { return static_cast<std::int32_t>(std::lround(gameUnits / GAME_UNITS_PER_METER)); }
+
+    // ---------------------------------------------------------------- heights
+    // How much higher or lower than the viewer the characters and things stand that the lists of a state name:
+    // a guard up on a wall and one on the ground are both "15 m ahead" otherwise. The lists themselves stay as they
+    // are. While they are built, each of them keeps the height of what it names here (KeepHeight), and the script
+    // fetches all of it once at the end of a state (TakeHeights). Only a difference of HEIGHT_MIN_METERS or more is kept
+
+    constexpr std::int32_t HEIGHT_MIN_METERS = 2;
+    constexpr std::size_t MAX_KEPT_HEIGHTS = 512;
+
+    struct KeptHeight {
+        RE::FormID viewerID = 0;
+        RE::FormID referenceID = 0;
+        std::int32_t meters = 0;
+    };
+
+    std::mutex heightLock;
+    std::vector<KeptHeight> keptHeights;
+
+    // upUnits: how far the reference lies above where the game has the viewer (see View)
+    void KeepHeight(RE::Actor* viewer, RE::FormID referenceID, float upUnits) {
+        if (!viewer || referenceID == 0) return;
+        // The height counts from the feet. In the saddle those are the hooves of the horse, as for the picture of GetView
+        RE::NiPointer<RE::Actor> mount;
+        if (viewer->GetMount(mount) && mount) upUnits += viewer->GetPosition().z - mount->GetPosition().z;
+        const std::int32_t meters = ToWholeMeters(upUnits);
+        const std::lock_guard<std::mutex> guard(heightLock);
+        std::erase_if(keptHeights, [&](const KeptHeight& kept) { return kept.referenceID == referenceID; });
+        if (meters > -HEIGHT_MIN_METERS && meters < HEIGHT_MIN_METERS) return;
+        // Nobody fetched them for a long time (a script that is older than this plugin)
+        if (keptHeights.size() >= MAX_KEPT_HEIGHTS) keptHeights.clear();
+        KeptHeight kept;
+        kept.viewerID = viewer->GetFormID();
+        kept.referenceID = referenceID;
+        kept.meters = meters;
+        keptHeights.push_back(kept);
+    }
+
+    // The heights kept since the last call, for what was measured from this viewer: two numbers each, the ref ID and
+    // how many whole meters it stands above the feet of the viewer (negative = below). What is missing stands
+    // less than HEIGHT_MIN_METERS higher or lower. Forgets all of them
+    std::vector<std::int32_t> TakeHeights(RE::StaticFunctionTag*, RE::Actor* viewer) {
+        std::vector<std::int32_t> numbers;
+        const std::lock_guard<std::mutex> guard(heightLock);
+        if (viewer) {
+            const RE::FormID viewerID = viewer->GetFormID();
+            for (const auto& kept : keptHeights) {
+                if (kept.viewerID != viewerID) continue;
+                numbers.push_back(static_cast<std::int32_t>(kept.referenceID));
+                numbers.push_back(kept.meters);
+            }
+        }
+        keptHeights.clear();
+        return numbers;
+    }
 
     // Whether nothing solid of the world lies between the eyes of a viewer and a thing at this position.
     // The game itself can only tell that for the player and between characters (Actor.HasLOS).
@@ -3060,7 +3118,10 @@ namespace Companion {
         const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_THING_RADIUS_METERS) * GAME_UNITS_PER_METER;
         const std::size_t limit = maxPerKind > 0 ? static_cast<std::size_t>(maxPerKind) : DEFAULT_MAX_THINGS_PER_KIND;
 
-        for (const auto& thing : CollectThings(viewer, radius, limit)) lines.push_back(GetThingLine(thing));
+        for (const auto& thing : CollectThings(viewer, radius, limit)) {
+            KeepHeight(viewer, thing.referenceID, thing.view.upUnits);
+            lines.push_back(GetThingLine(thing));
+        }
         logger::debug("GetNearbyThings: {} things sent", lines.size());
         return lines;
     }
@@ -3075,7 +3136,10 @@ namespace Companion {
         auto* viewer = GetViewer(origin, player);
         const float radius = static_cast<float>(radiusMeters > 0 ? radiusMeters : DEFAULT_TRAP_RADIUS_METERS) * GAME_UNITS_PER_METER;
         const std::size_t limit = maxTraps > 0 ? static_cast<std::size_t>(maxTraps) : DEFAULT_MAX_TRAPS;
-        for (const auto& trap : CollectTraps(viewer, radius, limit)) lines.push_back(GetThingLine(trap));
+        for (const auto& trap : CollectTraps(viewer, radius, limit)) {
+            KeepHeight(viewer, trap.referenceID, trap.view.upUnits);
+            lines.push_back(GetThingLine(trap));
+        }
         return lines;
     }
 
@@ -3150,7 +3214,10 @@ namespace Companion {
         if (!player || words.empty()) return lines;
         auto* viewer = GetViewer(origin, player);
         const std::size_t limit = maxResults > 0 ? static_cast<std::size_t>(maxResults) : DEFAULT_MAX_FOUND;
-        for (const auto& match : FindAround(player, viewer, words, limit)) lines.push_back(GetThingLine(match));
+        for (const auto& match : FindAround(player, viewer, words, limit)) {
+            KeepHeight(viewer, match.referenceID, match.view.upUnits);
+            lines.push_back(GetThingLine(match));
+        }
         logger::debug("FindByName: {} matches sent", lines.size());
         return lines;
     }
@@ -4037,6 +4104,7 @@ namespace Companion {
             } else if (canTellHostile && actor->IsHostileToActor(player)) {
                 fourth = 1;
             }
+            KeepHeight(viewer, actor->GetFormID(), view.upUnits);
             values.push_back(static_cast<std::int32_t>(actor->GetFormID()));
             values.push_back(view.distanceMeters);
             values.push_back(view.angleDegrees);
@@ -5033,7 +5101,15 @@ namespace Companion {
     // which are solid themselves. A character is looked at row by row of the picture, at the height of its body in
     // that row, never right at the edge of its box. One that is dead lies, so its box is low
     constexpr float VIEW_ITEM_AIM_UNITS = 10.0f;
-    constexpr float VIEW_ITEM_NEAR_UNITS = 20.0f;
+    // (In a second test an axe and tankards on the low board right behind the front of a counter still showed: the
+    // ray was allowed to end 20 units short of them, and the front stood closer to them than that)
+    constexpr float VIEW_ITEM_NEAR_UNITS = 4.0f;
+    // Something loose is small: with the box of a chest a wheel of cheese three meters away filled nine cells
+    constexpr float VIEW_ITEM_HEIGHT_UNITS = 20.0f;
+    constexpr float VIEW_ITEM_HALF_UNITS = 12.0f;
+    // A character keeps its place in a cell before any thing, however close the thing is: in that test the cheese
+    // on the counter pushed the innkeeper behind it out of every cell he stood in
+    constexpr float VIEW_THING_ORDER_UNITS = 1.0e7f;
     constexpr float VIEW_SOLID_AIM_UNITS = 30.0f;
     constexpr float VIEW_SOLID_NEAR_UNITS = 50.0f;
     constexpr float VIEW_DOOR_AIM_UNITS = 90.0f;
@@ -5110,21 +5186,25 @@ namespace Companion {
         std::int32_t isDrop = 0;
         std::array<std::int32_t, VIEW_ENTRIES_PER_CELL> entries = {0, 0};
         std::array<float, VIEW_ENTRIES_PER_CELL> entryUnits = {0.0f, 0.0f};
+        // What the entries are sorted by: characters first, then things, each the nearest first
+        std::array<float, VIEW_ENTRIES_PER_CELL> entryOrder = {0.0f, 0.0f};
     };
 
     std::mutex viewLock;
     std::vector<std::string> viewNames;
 
-    // Puts an entry of the legend into a cell, which keeps the nearest ones, the nearest first
-    void AddToViewCell(ViewCell& cell, std::int32_t legendNumber, float groundUnits) {
+    // Puts an entry of the legend into a cell, which keeps the first ones by "order" (see ViewCell)
+    void AddToViewCell(ViewCell& cell, std::int32_t legendNumber, float groundUnits, float order) {
         for (std::size_t place = 0; place < VIEW_ENTRIES_PER_CELL; ++place) {
-            if (cell.entries[place] != 0 && cell.entryUnits[place] <= groundUnits) continue;
+            if (cell.entries[place] != 0 && cell.entryOrder[place] <= order) continue;
             for (std::size_t moved = VIEW_ENTRIES_PER_CELL - 1; moved > place; --moved) {
                 cell.entries[moved] = cell.entries[moved - 1];
                 cell.entryUnits[moved] = cell.entryUnits[moved - 1];
+                cell.entryOrder[moved] = cell.entryOrder[moved - 1];
             }
             cell.entries[place] = legendNumber;
             cell.entryUnits[place] = groundUnits;
+            cell.entryOrder[place] = order;
             return;
         }
     }
@@ -5240,6 +5320,10 @@ namespace Companion {
                 const bool isSolid = thingKind != THING_IS_ITEM;
                 entry.aimUnits = isSolid ? VIEW_SOLID_AIM_UNITS : VIEW_ITEM_AIM_UNITS;
                 entry.nearUnits = isSolid ? VIEW_SOLID_NEAR_UNITS : VIEW_ITEM_NEAR_UNITS;
+                if (!isSolid) {
+                    entry.heightUnits = VIEW_ITEM_HEIGHT_UNITS;
+                    entry.halfUnits = VIEW_ITEM_HALF_UNITS;
+                }
             }
             entry.referenceID = reference->GetFormID();
             entry.feet = reference->GetPosition();
@@ -5355,7 +5439,7 @@ namespace Companion {
                         }
                         for (std::int32_t column = std::max(firstColumn, 0); column <= std::min(lastColumn, columns - 1); ++column) {
                             AddToViewCell(cells[static_cast<std::size_t>(row) * static_cast<std::size_t>(columns) + static_cast<std::size_t>(column)], legendNumber,
-                                          entry.groundUnits);
+                                          entry.groundUnits, entry.groundUnits + (isThing ? VIEW_THING_ORDER_UNITS : 0.0f));
                         }
                     }
                 }
@@ -5417,13 +5501,15 @@ namespace Companion {
     constexpr float SIGHT_EVENING_PERCENT = 50.0f;
     constexpr float SIGHT_NIGHT_PERCENT = 25.0f;
     constexpr float HOURS_PER_DAY = 24.0f;
-    // Indoors: the light level the game tells for where a character stands (Actor.GetLightLevel of a script, 0 to
-    // 150). NOT MEASURED YET: where bright ends and dark begins has to be read off in the game and set here
-    constexpr std::int32_t SIGHT_BRIGHT_LIGHT = 60;
-    constexpr std::int32_t SIGHT_DIM_LIGHT = 20;
+    // Indoors a place is bright unless the game keeps it as a dungeon (caves, crypts, ruins, mines: their location, or
+    // one it lies in, carries this keyword). The light level the game tells a script (Actor.GetLightLevel) is not
+    // used: in a test it was 0 for the companion in an inn lit by a fire and candles. In a dark place a torch in
+    // the hand of the companion, or of the player beside it, lets it see further
+    constexpr std::string_view SIGHT_DARK_PLACE_KEYWORD = "LocTypeDungeon";
+    constexpr std::int32_t SIGHT_MAX_PARENT_LOCATIONS = 6;
     constexpr float SIGHT_BRIGHT_METERS = 50.0f;
-    constexpr float SIGHT_DIM_METERS = 25.0f;
-    constexpr float SIGHT_DARK_METERS = 8.0f;
+    constexpr float SIGHT_DARK_METERS = 15.0f;
+    constexpr float SIGHT_DARK_TORCH_METERS = 25.0f;
     constexpr std::int32_t SIGHT_LIGHT_NOT_USED = 0;
     constexpr std::int32_t SIGHT_LIGHT_BRIGHT = 1;
     constexpr std::int32_t SIGHT_LIGHT_DIM = 2;
@@ -5449,6 +5535,16 @@ namespace Companion {
         return SIGHT_EVENING_PERCENT - sinceEvening / untilDeepNight * (SIGHT_EVENING_PERCENT - SIGHT_NIGHT_PERCENT);
     }
 
+    // Whether the place a character is in counts as dark (see SIGHT_DARK_PLACE_KEYWORD)
+    bool IsInDarkPlace(const RE::Actor* viewer) {
+        const RE::BGSLocation* location = viewer->GetCurrentLocation();
+        for (std::int32_t step = 0; location && step < SIGHT_MAX_PARENT_LOCATIONS; ++step) {
+            if (location->HasKeywordString(SIGHT_DARK_PLACE_KEYWORD)) return true;
+            location = location->parentLoc;
+        }
+        return false;
+    }
+
     bool HoldsTorch(RE::Actor* holder) {
         const RE::TESForm* rightHand = holder->GetEquippedObject(false);
         const RE::TESForm* leftHand = holder->GetEquippedObject(true);
@@ -5471,16 +5567,17 @@ namespace Companion {
         float timePercent = SIGHT_FULL_PERCENT;
         std::int32_t light = SIGHT_LIGHT_NOT_USED;
         float meters = SIGHT_CLEAR_METERS;
+        const bool hasTorch = HoldsTorch(viewer) ||
+                              (viewer != player && viewer->GetPosition().GetDistance(player->GetPosition()) <= SIGHT_TORCH_NEAR_UNITS && HoldsTorch(player));
+        bool isTorchUsed = false;
         if (isIndoors) {
-            if (lightLevel < 0 || lightLevel >= SIGHT_BRIGHT_LIGHT) {
+            if (IsInDarkPlace(viewer)) {
+                light = SIGHT_LIGHT_DARK;
+                meters = hasTorch ? SIGHT_DARK_TORCH_METERS : SIGHT_DARK_METERS;
+                isTorchUsed = hasTorch;
+            } else {
                 light = SIGHT_LIGHT_BRIGHT;
                 meters = SIGHT_BRIGHT_METERS;
-            } else if (lightLevel >= SIGHT_DIM_LIGHT) {
-                light = SIGHT_LIGHT_DIM;
-                meters = SIGHT_DIM_METERS;
-            } else {
-                light = SIGHT_LIGHT_DARK;
-                meters = SIGHT_DARK_METERS;
             }
         } else {
             weather = GetWeatherClass();
@@ -5507,10 +5604,10 @@ namespace Companion {
             timePercent = GetSightTimePercent(minutesOfDay);
             meters = meters * timePercent / SIGHT_FULL_PERCENT;
         }
-        const bool hasTorch = HoldsTorch(viewer) ||
-                              (viewer != player && viewer->GetPosition().GetDistance(player->GetPosition()) <= SIGHT_TORCH_NEAR_UNITS && HoldsTorch(player));
-        const bool isTorchUsed = hasTorch && meters < SIGHT_TORCH_METERS;
-        if (isTorchUsed) meters = SIGHT_TORCH_METERS;
+        if (hasTorch && meters < SIGHT_TORCH_METERS) {
+            isTorchUsed = true;
+            meters = SIGHT_TORCH_METERS;
+        }
         meters = std::max(meters, 1.0f);
         {
             const std::lock_guard<std::mutex> guard(sightLock);
@@ -5579,6 +5676,7 @@ namespace Companion {
         vm->RegisterFunction("GetView", SCRIPT_NAME, GetView);
         vm->RegisterFunction("GetViewNames", SCRIPT_NAME, GetViewNames);
         vm->RegisterFunction("UpdateSight", SCRIPT_NAME, UpdateSight);
+        vm->RegisterFunction("TakeHeights", SCRIPT_NAME, TakeHeights);
         return true;
     }
 
