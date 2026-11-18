@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 36;
+    constexpr std::int32_t INTERFACE_VERSION = 37;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -3228,6 +3228,14 @@ namespace Companion {
         return lines;
     }
 
+    // What kind of ammunition an item is: 0 = none, 1 = an arrow, 2 = a bolt for a crossbow. The script cannot tell
+    // arrows from bolts itself. For the favorites of the companion, which only fit the weapon of their kind
+    std::int32_t GetAmmoKind(RE::StaticFunctionTag*, RE::TESForm* item) {
+        auto* ammo = item ? item->As<RE::TESAmmo>() : nullptr;
+        if (!ammo) return 0;
+        return ammo->IsBolt() ? 2 : 1;
+    }
+
     // Whether this is a piece of furniture a character can lie down and sleep on. The script cannot tell that itself
     bool IsBed(RE::StaticFunctionTag*, RE::TESObjectREFR* reference) {
         const auto* base = reference ? reference->GetBaseObject() : nullptr;
@@ -5691,6 +5699,7 @@ namespace Companion {
         vm->RegisterFunction("UpdateSight", SCRIPT_NAME, UpdateSight);
         vm->RegisterFunction("TakeHeights", SCRIPT_NAME, TakeHeights);
         vm->RegisterFunction("IsBed", SCRIPT_NAME, IsBed);
+        vm->RegisterFunction("GetAmmoKind", SCRIPT_NAME, GetAmmoKind);
         return true;
     }
 
