@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 35;
+    constexpr std::int32_t INTERFACE_VERSION = 36;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -136,6 +136,8 @@ namespace Companion {
     constexpr std::int32_t THING_IS_TRAP = 3;
     // For furniture: a character can sit on it. For a container: it is locked
     constexpr std::int32_t FURNITURE_IS_SEAT = 1;
+    // A character can lie down and sleep on it (see the command sleep)
+    constexpr std::int32_t FURNITURE_IS_BED = 2;
     constexpr std::int32_t CONTAINER_IS_LOCKED = 1;
     // The flag of a container that is not locked: this times (the number of different items in it + 1),
     // so that an empty container (2) can be told from one of an older plugin that does not count (0)
@@ -1054,7 +1056,11 @@ namespace Companion {
             thing.view = GetViewFrom(viewer, reference->GetPosition());
             if (kind == THING_IS_FURNITURE) {
                 const auto* furniture = base->As<RE::TESFurniture>();
-                if (furniture && furniture->furnFlags.any(RE::TESFurniture::ActiveMarker::kCanSit)) thing.flags = FURNITURE_IS_SEAT;
+                if (furniture && furniture->furnFlags.any(RE::TESFurniture::ActiveMarker::kCanSleep)) {
+                    thing.flags = FURNITURE_IS_BED;
+                } else if (furniture && furniture->furnFlags.any(RE::TESFurniture::ActiveMarker::kCanSit)) {
+                    thing.flags = FURNITURE_IS_SEAT;
+                }
             } else if (kind == THING_IS_CONTAINER) {
                 const auto* extra = reference->extraList.GetByType<RE::ExtraLock>();
                 if (extra && extra->lock && extra->lock->IsLocked()) {
@@ -3109,7 +3115,7 @@ namespace Companion {
     // One text per thing, its parts separated by tabs:
     // kind (0 = furniture, 1 = container, 2 = item), ref ID as eight hex digits, distance to the viewer in meters,
     // angle from where the viewer faces in degrees (negative = left),
-    // for furniture 1 if a character can sit on it, for a container 1 if it is locked, otherwise 2 x (the number of different items in it + 1), name
+    // for furniture 1 if a character can sit on it and 2 if it can sleep on it, for a container 1 if it is locked, otherwise 2 x (the number of different items in it + 1), name
     std::vector<std::string> GetNearbyThings(RE::StaticFunctionTag*, std::int32_t radiusMeters, std::int32_t maxPerKind, RE::Actor* origin) {
         std::vector<std::string> lines;
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -3220,6 +3226,13 @@ namespace Companion {
         }
         logger::debug("FindByName: {} matches sent", lines.size());
         return lines;
+    }
+
+    // Whether this is a piece of furniture a character can lie down and sleep on. The script cannot tell that itself
+    bool IsBed(RE::StaticFunctionTag*, RE::TESObjectREFR* reference) {
+        const auto* base = reference ? reference->GetBaseObject() : nullptr;
+        const auto* furniture = base ? base->As<RE::TESFurniture>() : nullptr;
+        return furniture && furniture->furnFlags.any(RE::TESFurniture::ActiveMarker::kCanSleep);
     }
 
     // The reference with this ID (given in its upper and lower 16 bits, as the companion server sends IDs), or nullptr
@@ -5677,6 +5690,7 @@ namespace Companion {
         vm->RegisterFunction("GetViewNames", SCRIPT_NAME, GetViewNames);
         vm->RegisterFunction("UpdateSight", SCRIPT_NAME, UpdateSight);
         vm->RegisterFunction("TakeHeights", SCRIPT_NAME, TakeHeights);
+        vm->RegisterFunction("IsBed", SCRIPT_NAME, IsBed);
         return true;
     }
 
