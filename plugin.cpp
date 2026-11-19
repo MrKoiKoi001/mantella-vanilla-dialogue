@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 38;
+    constexpr std::int32_t INTERFACE_VERSION = 40;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -1777,6 +1777,11 @@ namespace Companion {
     // a hit on one of them and its death are news wherever it stands
     std::atomic<RE::FormID> eventOwnHorseID{ 0 };
     std::atomic<RE::FormID> eventPlayerHorseID{ 0 };
+    // A hit on one of these horses is told once per fight of the horse: while its hits come at most this far apart,
+    // it is the same fight, whoever hits. horseHitTimes: when each horse was hit last. Guarded by eventLock
+    constexpr std::int64_t HORSE_FIGHT_GAP_SECONDS = 30;
+    constexpr std::size_t MAX_KEPT_HORSE_HITS = 8;
+    std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> horseHitTimes;
     // Whether the companion is to follow the player right now, as the script tells with every TickWatch
     std::atomic<bool> isCompanionFollowing{ false };
     // A save was loaded: what CheckWatch remembers belongs to another game
@@ -2010,9 +2015,21 @@ namespace Companion {
         auto* target = event.target.get();
         auto* attacker = event.cause.get();
         if ((IsOwnHorse(target) || IsPlayersHorse(target)) && attacker != target) {
-            // One sentence per attacker and fight, however many hits the horse takes
-            KeepEvent(GetEventName(target, true) + " is being attacked" + (attacker ? " by " + GetEventName(attacker, false) : std::string()) + ".", true,
-                      SAME_FIGHT_SECONDS);
+            // One sentence per fight of the horse, however many hits it takes and from however many attackers
+            // (see HORSE_FIGHT_GAP_SECONDS). In a test a horse between two wolves was told again and again
+            const auto hitTime = std::chrono::steady_clock::now();
+            bool isNewFight = false;
+            {
+                const std::lock_guard<std::mutex> guard(eventLock);
+                const auto known = horseHitTimes.find(target->GetFormID());
+                isNewFight = known == horseHitTimes.end() || SecondsBetween(known->second, hitTime) >= HORSE_FIGHT_GAP_SECONDS;
+                if (horseHitTimes.size() > MAX_KEPT_HORSE_HITS) horseHitTimes.clear();
+                horseHitTimes[target->GetFormID()] = hitTime;
+            }
+            if (isNewFight) {
+                KeepEvent(GetEventName(target, true) + " is being attacked" + (attacker ? " by " + GetEventName(attacker, false) : std::string()) + ".",
+                          true, SAME_FIGHT_SECONDS);
+            }
             return;
         }
         if (!IsWatched(target) || attacker == target) return;
@@ -2328,6 +2345,7 @@ namespace Companion {
         spottedCharacters.clear();
         sensedCharacters.clear();
         spottedTraps.clear();
+        horseHitTimes.clear();
         hasSlowCheck = false;
         isWatchForgotten.store(true);
     }
@@ -2525,6 +2543,10 @@ namespace Companion {
     constexpr std::int64_t SPOT_AGAIN_SECONDS = 120;
     constexpr std::size_t MAX_NAMED_SPOTS = 3;
     constexpr std::size_t MAX_REMEMBERED_SPOTS = 300;
+    // The game counts prey as hostile (deer, elk, wild goats, hares, foxes, chickens, cows), but it always runs
+    // away: its actor value "Confidence" is 0 (cowardly). Whoever has less than this is no danger to tell of. If
+    // it attacks after all, the fight has its events
+    constexpr float SPOT_LEAST_CONFIDENCE = 1.0f;
 
     struct Spot {
         RE::FormID referenceID = 0;
@@ -2579,6 +2601,10 @@ namespace Companion {
                 auto* actor = reference->As<RE::Actor>();
                 if (!actor || !actor->Is3DLoaded() || actor->IsDead() || actor->IsPlayerTeammate()) return RE::BSContainer::ForEachResult::kContinue;
                 if (!actor->IsHostileToActor(player) && !actor->IsHostileToActor(companion)) return RE::BSContainer::ForEachResult::kContinue;
+                const auto* actorValues = actor->AsActorValueOwner();
+                if (actorValues && actorValues->GetActorValue(RE::ActorValue::kConfidence) < SPOT_LEAST_CONFIDENCE) {
+                    return RE::BSContainer::ForEachResult::kContinue;
+                }
                 Spot spot;
                 spot.referenceID = actor->GetFormID();
                 spot.position = actor->GetPosition();
@@ -2680,7 +2706,20 @@ namespace Companion {
             if (heardOnes.size() > 1) text += std::format(" (and {} more sounds around you)", heardOnes.size() - 1);
             KeepEvent(text + ".", true, 0);
         }
-        for (const auto& spot : traps) KeepEvent("You see a trap (" + spot.name + ") " + DescribeSpot(spot.view) + ".", true, 0);
+        // Traps of one kind come in one sentence, with where the nearest one is: a room full of oil on the floor came
+        // as eight sentences at a time
+        std::sort(traps.begin(), traps.end(), [](const Spot& left, const Spot& right) { return left.view.distanceMeters < right.view.distanceMeters; });
+        std::vector<std::string> toldTrapNames;
+        for (const auto& spot : traps) {
+            if (std::find(toldTrapNames.begin(), toldTrapNames.end(), spot.name) != toldTrapNames.end()) continue;
+            toldTrapNames.push_back(spot.name);
+            const auto sameCount = std::count_if(traps.begin(), traps.end(), [&](const Spot& other) { return other.name == spot.name; });
+            if (sameCount == 1) {
+                KeepEvent("You see a trap (" + spot.name + ") " + DescribeSpot(spot.view) + ".", true, 0);
+            } else {
+                KeepEvent(std::format("You see {} traps ({}), the nearest {}.", sameCount, spot.name, DescribeSpot(spot.view)), true, 0);
+            }
+        }
     }
 
     // ------------------------------------------------------------------ watch
@@ -2696,6 +2735,12 @@ namespace Companion {
     constexpr std::int64_t BEHIND_QUIET_SECONDS = 60;
     // A companion that is to follow but is not in the loaded area for this many checks in a row was left behind
     constexpr std::int32_t BEHIND_UNLOADED_CHECKS = 5;
+    // The horse left behind: the player rides, the companion is to follow and walks, and its own horse is further
+    // away from it than this (or not in the loaded area), for this many checks in a row. Told once, and again only
+    // after that was over in between and after HORSE_AWAY_QUIET_SECONDS
+    constexpr float HORSE_AWAY_UNITS = 40.0f * GAME_UNITS_PER_METER;
+    constexpr std::int32_t HORSE_AWAY_CHECKS = 5;
+    constexpr std::int64_t HORSE_AWAY_QUIET_SECONDS = 120;
     // Stuck: the animation says the companion moves (see STUCK_SPEED_VARIABLE), but it got less far than this
     // between two checks, STUCK_CHECKS times in a row
     constexpr float STUCK_UNITS = 50.0f;
@@ -2724,6 +2769,13 @@ namespace Companion {
         bool hasBehindNews = false;
         std::chrono::steady_clock::time_point behindNewsTime;
         std::int32_t unloadedChecks = 0;
+        // Told already that it is not where the player is, for this stay outside the loaded area
+        bool isLeftBehind = false;
+        // The horse left behind
+        std::int32_t horseAwayChecks = 0;
+        bool isHorseAwayTold = false;
+        bool hasHorseAwayNews = false;
+        std::chrono::steady_clock::time_point horseAwayNewsTime;
         // Getting stuck
         bool hasSpot = false;
         bool wasMoving = false;
@@ -2785,21 +2837,24 @@ namespace Companion {
         if (!isFollowing || isWaiting || isFighting) {
             state.wasFollowing = false;
             state.unloadedChecks = 0;
+            state.isLeftBehind = false;
         } else if (!isLoaded) {
-            if (!state.wasFollowing) {
-                // It begins to follow from somewhere else: that is no news
-                state.wasFollowing = true;
-                state.isBehind = true;
-            } else if (!state.isBehind && ++state.unloadedChecks >= BEHIND_UNLOADED_CHECKS) {
-                state.isBehind = true;
-                if (canTellBehind) {
-                    state.hasBehindNews = true;
-                    state.behindNewsTime = now;
-                    news.push_back({"You have fallen behind: you are no longer where the player is.", false});
-                }
+            // Not where the player is: the player went through a door or far ahead. That is news of its own, told
+            // once for every time it happens, also when the distance was told a moment ago. (In a test the companion
+            // was told that it was 44 m behind, the player went through a door ten seconds later, and nothing came)
+            state.wasFollowing = true;
+            state.isBehind = true;
+            if (!state.isLeftBehind && ++state.unloadedChecks >= BEHIND_UNLOADED_CHECKS) {
+                state.isLeftBehind = true;
+                state.hasBehindNews = true;
+                state.behindNewsTime = now;
+                news.push_back(
+                    {"You have fallen behind: the player went on without you (through a door, or far ahead), and you are no longer where the player is.",
+                     false});
             }
         } else {
             state.unloadedChecks = 0;
+            state.isLeftBehind = false;
             const float distance = companion->GetPosition().GetDistance(player->GetPosition());
             const float startUnits = isRiding ? BEHIND_RIDE_START_UNITS : BEHIND_FOOT_START_UNITS;
             const float endUnits = isRiding ? BEHIND_RIDE_END_UNITS : BEHIND_FOOT_END_UNITS;
@@ -2815,6 +2870,30 @@ namespace Companion {
                     state.hasBehindNews = true;
                     state.behindNewsTime = now;
                     news.push_back({std::format("You have fallen behind: the player is about {} m away from you.", ToWholeMeters(distance)), false});
+                }
+            }
+        }
+
+        // The horse left behind: the player rides, and the companion walks after it without its horse
+        const RE::FormID ownHorseID = eventOwnHorseID.load();
+        auto* ownHorse = ownHorseID != 0 ? RE::TESForm::LookupByID<RE::Actor>(ownHorseID) : nullptr;
+        const bool isHorseNear = ownHorse && ownHorse->Is3DLoaded() && ownHorse->GetPosition().GetDistance(companion->GetPosition()) <= HORSE_AWAY_UNITS;
+        const bool isHorseAway =
+            isFollowing && !isWaiting && !isFighting && isLoaded && !isRiding && player->IsOnMount() && ownHorse && !ownHorse->IsDead() && !isHorseNear;
+        if (!isHorseAway) {
+            state.horseAwayChecks = 0;
+            state.isHorseAwayTold = false;
+        } else if (!state.isHorseAwayTold && ++state.horseAwayChecks >= HORSE_AWAY_CHECKS) {
+            state.isHorseAwayTold = true;
+            if (!state.hasHorseAwayNews || SecondsBetween(state.horseAwayNewsTime, now) >= HORSE_AWAY_QUIET_SECONDS) {
+                state.hasHorseAwayNews = true;
+                state.horseAwayNewsTime = now;
+                if (ownHorse->Is3DLoaded()) {
+                    const float horseDistance = ownHorse->GetPosition().GetDistance(companion->GetPosition());
+                    news.push_back(
+                        {std::format("The player rides and you are on foot: your horse is about {} m away from you.", ToWholeMeters(horseDistance)), false});
+                } else {
+                    news.push_back({"The player rides and you are on foot: your horse is not where you are.", false});
                 }
             }
         }
