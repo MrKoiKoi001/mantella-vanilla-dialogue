@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 37;
+    constexpr std::int32_t INTERFACE_VERSION = 38;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -1773,11 +1773,21 @@ namespace Companion {
     std::atomic<RE::FormID> eventCompanionID{ 0 };
     // While the script itself moves things between the companion and the player (give, take), that is no news
     std::atomic<bool> skipsTransfers{ false };
+    // The horse of the companion and the horse of the player, as the script tells them (see SetWatchedHorses, 0 = none):
+    // a hit on one of them and its death are news wherever it stands
+    std::atomic<RE::FormID> eventOwnHorseID{ 0 };
+    std::atomic<RE::FormID> eventPlayerHorseID{ 0 };
+    // Whether the companion is to follow the player right now, as the script tells with every TickWatch
+    std::atomic<bool> isCompanionFollowing{ false };
+    // A save was loaded: what CheckWatch remembers belongs to another game
+    std::atomic<bool> isWatchForgotten{ false };
 
     // The journal as TickEvents saw it last: the quests with an objective that is shown and open (see CheckQuests)
     struct QuestSample {
         const RE::TESQuest* quest = nullptr;
         std::string name;
+        // Whether the player has picked it in the journal as a quest to follow
+        bool isActive = false;
         std::vector<const RE::BGSQuestObjective*> objectives;
         std::vector<std::string> texts;
     };
@@ -1831,11 +1841,23 @@ namespace Companion {
 
     bool IsWatched(const RE::TESObjectREFR* reference) { return reference && (reference->IsPlayerRef() || IsEventCompanion(reference)); }
 
+    bool IsOwnHorse(const RE::TESObjectREFR* reference) {
+        const RE::FormID horseID = eventOwnHorseID.load();
+        return reference && horseID != 0 && reference->GetFormID() == horseID;
+    }
+
+    bool IsPlayersHorse(const RE::TESObjectREFR* reference) {
+        const RE::FormID horseID = eventPlayerHorseID.load();
+        return reference && horseID != 0 && reference->GetFormID() == horseID;
+    }
+
     // How the texts call a character or a thing. isFirst: the name begins a sentence
     std::string GetEventName(RE::TESObjectREFR* reference, bool isFirst) {
         if (reference) {
             if (reference->IsPlayerRef()) return isFirst ? "The player" : "the player";
             if (IsEventCompanion(reference)) return isFirst ? "You" : "you";
+            if (IsOwnHorse(reference)) return isFirst ? "Your horse" : "your horse";
+            if (IsPlayersHorse(reference)) return isFirst ? "The player's horse" : "the player's horse";
             std::string name = CleanText(ViewOf(reference->GetDisplayFullName()));
             if (!name.empty()) return name;
         }
@@ -1975,7 +1997,7 @@ namespace Companion {
         auto* victim = event.actorDying.get();
         auto* killer = event.actorKiller.get();
         if (!victim) return;
-        if (!IsWatched(victim) && !IsWatched(killer) && !IsNearPlayer(victim)) return;
+        if (!IsWatched(victim) && !IsWatched(killer) && !IsNearPlayer(victim) && !IsOwnHorse(victim) && !IsPlayersHorse(victim)) return;
         // The game tells a death twice (dying, dead). The second one has the same text and is dropped
         if (killer && killer != victim) {
             KeepEvent(GetEventName(killer, true) + " killed " + GetEventName(victim, false) + ".", true);
@@ -1987,6 +2009,12 @@ namespace Companion {
     void OnHitEvent(const RE::TESHitEvent& event) {
         auto* target = event.target.get();
         auto* attacker = event.cause.get();
+        if ((IsOwnHorse(target) || IsPlayersHorse(target)) && attacker != target) {
+            // One sentence per attacker and fight, however many hits the horse takes
+            KeepEvent(GetEventName(target, true) + " is being attacked" + (attacker ? " by " + GetEventName(attacker, false) : std::string()) + ".", true,
+                      SAME_FIGHT_SECONDS);
+            return;
+        }
         if (!IsWatched(target) || attacker == target) return;
         const std::size_t watched = target->IsPlayerRef() ? WATCHED_PLAYER : WATCHED_COMPANION;
         const std::string attackerName = attacker ? GetEventName(attacker, false) : std::string();
@@ -2301,6 +2329,7 @@ namespace Companion {
         sensedCharacters.clear();
         spottedTraps.clear();
         hasSlowCheck = false;
+        isWatchForgotten.store(true);
     }
 
     // The game is running again: a moment later events are kept again (see QUIET_AFTER_LOAD_SECONDS)
@@ -2342,6 +2371,7 @@ namespace Companion {
             QuestSample sample;
             sample.quest = open.quest;
             sample.name = CleanText(ViewOf(open.quest->GetName()));
+            sample.isActive = open.quest->IsActive();
             sample.objectives = std::move(open.objectiveForms);
             sample.texts = std::move(open.objectives);
             now.push_back(std::move(sample));
@@ -2366,6 +2396,8 @@ namespace Companion {
                         texts.push_back(sample.name.empty() ? "New objective: " + added + "." : "New quest: " + sample.name + ". Objective: " + added + ".");
                         continue;
                     }
+                    // The player picked another quest to follow in the journal
+                    if (sample.isActive && !before->isActive && !sample.name.empty()) texts.push_back("The player now follows the quest " + sample.name + ".");
                     std::string done;
                     std::string failed;
                     for (std::size_t index = 0; index < before->objectives.size() && index < before->texts.size(); ++index) {
@@ -2651,6 +2683,290 @@ namespace Companion {
         for (const auto& spot : traps) KeepEvent("You see a trap (" + spot.name + ") " + DescribeSpot(spot.view) + ".", true, 0);
     }
 
+    // ------------------------------------------------------------------ watch
+    // What an AI that waits for something to happen should hear of, and no event of the game tells: the companion
+    // falls behind the player or gets stuck, its arrows or potions run low, the player gets a bounty or a level.
+    // Looked at with the slow checks. Each of these becomes an event like any other
+
+    constexpr float BEHIND_FOOT_START_UNITS = 40.0f * GAME_UNITS_PER_METER;
+    constexpr float BEHIND_FOOT_END_UNITS = 10.0f * GAME_UNITS_PER_METER;
+    constexpr float BEHIND_RIDE_START_UNITS = 80.0f * GAME_UNITS_PER_METER;
+    constexpr float BEHIND_RIDE_END_UNITS = 20.0f * GAME_UNITS_PER_METER;
+    // After the companion was told that it fell behind, it is not told again for this long
+    constexpr std::int64_t BEHIND_QUIET_SECONDS = 60;
+    // A companion that is to follow but is not in the loaded area for this many checks in a row was left behind
+    constexpr std::int32_t BEHIND_UNLOADED_CHECKS = 5;
+    // Stuck: the animation says the companion moves (see STUCK_SPEED_VARIABLE), but it got less far than this
+    // between two checks, STUCK_CHECKS times in a row
+    constexpr float STUCK_UNITS = 50.0f;
+    constexpr std::int32_t STUCK_CHECKS = 2;
+    constexpr std::int64_t STUCK_QUIET_SECONDS = 60;
+    constexpr const char* STUCK_SPEED_VARIABLE = "Speed";
+    constexpr float STUCK_SPEED = 1.0f;
+    constexpr std::int32_t AMMO_FIRST_WARNING = 20;
+    constexpr std::int32_t AMMO_SECOND_WARNING = 5;
+    // In a fight with less than this left and no potion for it, the companion is in need
+    constexpr float NEED_PERCENT = 50.0f;
+    constexpr std::int32_t AMMO_IS_NONE = 0;
+    constexpr std::int32_t AMMO_IS_ARROW = 1;
+    constexpr std::int32_t AMMO_IS_BOLT = 2;
+
+    struct WatchNews {
+        std::string text;
+        bool isUrgent = false;
+    };
+
+    struct WatchState {
+        RE::FormID companionID = 0;
+        // Falling behind
+        bool wasFollowing = false;
+        bool isBehind = false;
+        bool hasBehindNews = false;
+        std::chrono::steady_clock::time_point behindNewsTime;
+        std::int32_t unloadedChecks = 0;
+        // Getting stuck
+        bool hasSpot = false;
+        bool wasMoving = false;
+        RE::NiPoint3 spot;
+        std::int32_t stuckChecks = 0;
+        bool hasStuckNews = false;
+        std::chrono::steady_clock::time_point stuckNewsTime;
+        // Arrows and potions
+        bool hasSupplies = false;
+        std::int32_t ammoKind = AMMO_IS_NONE;
+        std::int32_t ammoCount = 0;
+        std::int32_t healPotions = 0;
+        std::int32_t magickaPotions = 0;
+        bool isHealthNeedTold = false;
+        bool isMagickaNeedTold = false;
+        // The player
+        bool hasLevel = false;
+        std::uint16_t playerLevel = 0;
+        bool hasBounties = false;
+        std::unordered_map<RE::FormID, float> bounties;
+    };
+
+    std::mutex watchLock;
+    WatchState watchState;
+
+    // What a potion gives back, as the actor value of its costliest effect: kHealth for a healing potion, kMagicka for a
+    // magicka potion. kNone for everything else (poison, food, a potion that fortifies or resists)
+    RE::ActorValue GetRestoredValue(RE::AlchemyItem* potion) {
+        if (!potion || potion->IsPoison() || potion->IsFood()) return RE::ActorValue::kNone;
+        const RE::Effect* strongest = nullptr;
+        for (const auto* effect : potion->effects) {
+            if (effect && effect->baseEffect && (!strongest || effect->cost > strongest->cost)) strongest = effect;
+        }
+        if (!strongest) return RE::ActorValue::kNone;
+        const auto* base = strongest->baseEffect;
+        if (base->GetArchetype() != RE::EffectSetting::Archetype::kValueModifier || base->IsDetrimental() || base->IsHostile()) return RE::ActorValue::kNone;
+        return base->data.primaryAV;
+    }
+
+    float GetPercentOf(RE::Actor* actor, RE::ActorValue value) {
+        const auto* values = actor ? actor->AsActorValueOwner() : nullptr;
+        if (!values) return FULL_PERCENT;
+        const float full = values->GetPermanentActorValue(value);
+        return full > 0.0f ? std::clamp(values->GetActorValue(value) / full * FULL_PERCENT, 0.0f, FULL_PERCENT) : FULL_PERCENT;
+    }
+
+    // Only call this while watchLock is held. isFollowing: the companion is to follow the player (see TickWatch)
+    void CheckProgressLocked(RE::Actor* companion, RE::PlayerCharacter* player, bool isFollowing, std::chrono::steady_clock::time_point now,
+                             std::vector<WatchNews>& news) {
+        WatchState& state = watchState;
+        const bool isLoaded = companion->Is3DLoaded();
+        const bool isFighting = companion->IsInCombat();
+        const bool isRiding = companion->IsOnMount();
+        const auto* values = companion->AsActorValueOwner();
+        const bool isWaiting = values && values->GetActorValue(RE::ActorValue::kWaitingForPlayer) > 0.0f;
+        const bool canTellBehind = !state.hasBehindNews || SecondsBetween(state.behindNewsTime, now) >= BEHIND_QUIET_SECONDS;
+
+        // Falling behind: only a companion that is to follow the player can
+        if (!isFollowing || isWaiting || isFighting) {
+            state.wasFollowing = false;
+            state.unloadedChecks = 0;
+        } else if (!isLoaded) {
+            if (!state.wasFollowing) {
+                // It begins to follow from somewhere else: that is no news
+                state.wasFollowing = true;
+                state.isBehind = true;
+            } else if (!state.isBehind && ++state.unloadedChecks >= BEHIND_UNLOADED_CHECKS) {
+                state.isBehind = true;
+                if (canTellBehind) {
+                    state.hasBehindNews = true;
+                    state.behindNewsTime = now;
+                    news.push_back({"You have fallen behind: you are no longer where the player is.", false});
+                }
+            }
+        } else {
+            state.unloadedChecks = 0;
+            const float distance = companion->GetPosition().GetDistance(player->GetPosition());
+            const float startUnits = isRiding ? BEHIND_RIDE_START_UNITS : BEHIND_FOOT_START_UNITS;
+            const float endUnits = isRiding ? BEHIND_RIDE_END_UNITS : BEHIND_FOOT_END_UNITS;
+            if (!state.wasFollowing) {
+                // It begins to follow (after a wait, a fight, a walk): where it stands now is no news
+                state.wasFollowing = true;
+                state.isBehind = distance > startUnits;
+            } else if (state.isBehind) {
+                if (distance < endUnits) state.isBehind = false;
+            } else if (distance > startUnits) {
+                state.isBehind = true;
+                if (canTellBehind) {
+                    state.hasBehindNews = true;
+                    state.behindNewsTime = now;
+                    news.push_back({std::format("You have fallen behind: the player is about {} m away from you.", ToWholeMeters(distance)), false});
+                }
+            }
+        }
+
+        // Getting stuck: walking without getting anywhere
+        if (!isLoaded || isRiding || isFighting) {
+            state.hasSpot = false;
+            state.wasMoving = false;
+            state.stuckChecks = 0;
+            return;
+        }
+        float speed = 0.0f;
+        const bool isMoving = companion->GetGraphVariableFloat(STUCK_SPEED_VARIABLE, speed) && speed >= STUCK_SPEED;
+        const RE::NiPoint3 spot = companion->GetPosition();
+        if (state.hasSpot && state.wasMoving && isMoving) {
+            const float east = spot.x - state.spot.x;
+            const float north = spot.y - state.spot.y;
+            if (std::sqrt(east * east + north * north) < STUCK_UNITS) {
+                ++state.stuckChecks;
+            } else {
+                state.stuckChecks = 0;
+            }
+        } else {
+            state.stuckChecks = 0;
+        }
+        state.hasSpot = true;
+        state.wasMoving = isMoving;
+        state.spot = spot;
+        if (state.stuckChecks == STUCK_CHECKS && (!state.hasStuckNews || SecondsBetween(state.stuckNewsTime, now) >= STUCK_QUIET_SECONDS)) {
+            state.hasStuckNews = true;
+            state.stuckNewsTime = now;
+            news.push_back({"You are stuck: you have been walking for some seconds without getting anywhere.", false});
+        }
+    }
+
+    // Only call this while watchLock is held
+    void CheckSuppliesLocked(RE::Actor* companion, std::vector<WatchNews>& news) {
+        WatchState& state = watchState;
+        if (!companion->Is3DLoaded()) return;
+        std::int32_t arrows = 0;
+        std::int32_t bolts = 0;
+        std::int32_t healPotions = 0;
+        std::int32_t magickaPotions = 0;
+        for (const auto& [object, entry] : companion->GetInventory()) {
+            if (!object || entry.first <= 0) continue;
+            if (auto* ammo = object->As<RE::TESAmmo>()) {
+                (ammo->IsBolt() ? bolts : arrows) += entry.first;
+            } else if (auto* potion = object->As<RE::AlchemyItem>()) {
+                const RE::ActorValue restored = GetRestoredValue(potion);
+                if (restored == RE::ActorValue::kHealth) healPotions += entry.first;
+                if (restored == RE::ActorValue::kMagicka) magickaPotions += entry.first;
+            }
+        }
+        // The ammunition that counts is the kind the companion has on (arrows or bolts). With none on, the kind it had last
+        std::int32_t ammoKind = state.ammoKind;
+        if (auto* current = companion->GetCurrentAmmo()) ammoKind = current->IsBolt() ? AMMO_IS_BOLT : AMMO_IS_ARROW;
+        const std::int32_t ammoCount = ammoKind == AMMO_IS_BOLT ? bolts : (ammoKind == AMMO_IS_ARROW ? arrows : 0);
+        const RE::TESForm* rightHand = companion->GetEquippedObject(false);
+        const RE::TESForm* leftHand = companion->GetEquippedObject(true);
+        const bool usesSpells = (rightHand && rightHand->Is(RE::FormType::Spell)) || (leftHand && leftHand->Is(RE::FormType::Spell));
+
+        if (state.hasSupplies) {
+            const std::string ammoName = ammoKind == AMMO_IS_BOLT ? "bolts" : "arrows";
+            if (ammoKind != AMMO_IS_NONE && ammoKind == state.ammoKind && ammoCount < state.ammoCount) {
+                if (ammoCount <= 0) {
+                    news.push_back({"You are out of " + ammoName + ".", true});
+                } else if ((state.ammoCount > AMMO_SECOND_WARNING && ammoCount <= AMMO_SECOND_WARNING) ||
+                           (state.ammoCount > AMMO_FIRST_WARNING && ammoCount <= AMMO_FIRST_WARNING)) {
+                    news.push_back({std::format("You are low on {}: {} left.", ammoName, ammoCount), false});
+                }
+            }
+            if (healPotions < state.healPotions) {
+                if (healPotions == 0) {
+                    news.push_back({"You are out of healing potions.", false});
+                } else if (healPotions == 1) {
+                    news.push_back({"You are low on healing potions: 1 left.", false});
+                }
+            }
+            if (usesSpells && magickaPotions < state.magickaPotions) {
+                if (magickaPotions == 0) {
+                    news.push_back({"You are out of magicka potions.", false});
+                } else if (magickaPotions == 1) {
+                    news.push_back({"You are low on magicka potions: 1 left.", false});
+                }
+            }
+        }
+        state.hasSupplies = true;
+        state.ammoKind = ammoKind;
+        state.ammoCount = ammoCount;
+        state.healPotions = healPotions;
+        state.magickaPotions = magickaPotions;
+
+        // In need: hurt in a fight with nothing to drink against it. Told once, and again after it was better in between
+        const bool isFighting = companion->IsInCombat();
+        const bool isHealthNeeded = isFighting && healPotions == 0 && GetPercentOf(companion, RE::ActorValue::kHealth) < NEED_PERCENT;
+        if (isHealthNeeded && !state.isHealthNeedTold) news.push_back({"You are below half your health in a fight and have no healing potion.", true});
+        state.isHealthNeedTold = isHealthNeeded;
+        const bool isMagickaNeeded = isFighting && usesSpells && magickaPotions == 0 && GetPercentOf(companion, RE::ActorValue::kMagicka) < NEED_PERCENT;
+        if (isMagickaNeeded && !state.isMagickaNeedTold) news.push_back({"You are below half your magicka in a fight and have no magicka potion.", true});
+        state.isMagickaNeedTold = isMagickaNeeded;
+    }
+
+    // Only call this while watchLock is held: a level the player reached, and a bounty the player got
+    void CheckPlayerLocked(RE::PlayerCharacter* player, std::vector<WatchNews>& news) {
+        WatchState& state = watchState;
+        const std::uint16_t level = player->GetLevel();
+        if (state.hasLevel && level > state.playerLevel) news.push_back({std::format("The player reached level {}.", level), false});
+        state.hasLevel = true;
+        state.playerLevel = level;
+
+        std::unordered_map<RE::FormID, float> bounties;
+        for (const auto& entry : player->GetCrimeValue().crimeGoldMap) {
+            const auto* faction = entry.first;
+            if (!faction) continue;
+            const float bounty = entry.second.violentCur + entry.second.nonViolentCur;
+            bounties[faction->GetFormID()] = bounty;
+            if (!state.hasBounties) continue;
+            const auto known = state.bounties.find(faction->GetFormID());
+            const float before = known != state.bounties.end() ? known->second : 0.0f;
+            if (bounty < before + 1.0f) continue;
+            const std::string factionName = CleanText(ViewOf(faction->GetFullName()));
+            news.push_back({std::format("The player got a bounty of {} gold{} ({} in all there).", FormatNumber(bounty - before),
+                                        factionName.empty() ? std::string() : " with " + factionName, FormatNumber(bounty)),
+                            false});
+        }
+        state.hasBounties = true;
+        state.bounties = std::move(bounties);
+    }
+
+    // See "watch" above. Called with the slow checks
+    void CheckWatch(RE::Actor* companion) {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<WatchNews> news;
+        {
+            const std::lock_guard<std::mutex> guard(watchLock);
+            const RE::FormID companionID = companion && !companion->IsDead() ? companion->GetFormID() : 0;
+            if (isWatchForgotten.exchange(false) || watchState.companionID != companionID) {
+                // Another game or another companion: nothing of what was seen before counts
+                watchState = WatchState();
+                watchState.companionID = companionID;
+            }
+            if (companionID != 0) {
+                CheckProgressLocked(companion, player, isCompanionFollowing.load(), now, news);
+                CheckSuppliesLocked(companion, news);
+            }
+            CheckPlayerLocked(player, news);
+        }
+        for (const auto& entry : news) KeepEvent(entry.text, entry.isUrgent, 0);
+    }
+
     // What TickEvents does only every few seconds, because it costs more than a look at the player
     void RunSlowChecks(RE::Actor* companion) {
         if (areEventsQuiet.load()) return;
@@ -2663,6 +2979,7 @@ namespace Companion {
         }
         CheckQuests();
         SpotDangers(companion);
+        CheckWatch(companion);
     }
 
     // ------------------------------------------------------------------ books
@@ -3470,6 +3787,21 @@ namespace Companion {
         if (!fightText.empty()) KeepEvent(fightText, isFighting, SAME_FIGHT_SECONDS);
         // From interface version 20 on: quests that begin, go on and end, and what the companion spots
         RunSlowChecks(companion);
+    }
+
+    // Like TickEvents, from interface version 38 on. isFollowing: whether the companion is to follow the player right
+    // now (not sent somewhere, not seated, not holding a spot), which only the script knows. With it the plugin can
+    // tell when the companion falls behind (see CheckWatch)
+    void TickWatch(RE::StaticFunctionTag* tag, RE::Actor* companion, bool isFollowing) {
+        isCompanionFollowing.store(isFollowing);
+        TickEvents(tag, companion);
+    }
+
+    // Which horse is the companion's and which is the player's (None = none): a hit on one of them and its death
+    // become events wherever the horse stands
+    void SetWatchedHorses(RE::StaticFunctionTag*, RE::Actor* ownHorse, RE::Actor* playersHorse) {
+        eventOwnHorseID.store(ownHorse ? ownHorse->GetFormID() : 0);
+        eventPlayerHorseID.store(playersHorse ? playersHorse->GetFormID() : 0);
     }
 
     // One text per event, its parts separated by tabs: how many seconds ago, the time of day in the game in minutes
@@ -5700,6 +6032,8 @@ namespace Companion {
         vm->RegisterFunction("TakeHeights", SCRIPT_NAME, TakeHeights);
         vm->RegisterFunction("IsBed", SCRIPT_NAME, IsBed);
         vm->RegisterFunction("GetAmmoKind", SCRIPT_NAME, GetAmmoKind);
+        vm->RegisterFunction("TickWatch", SCRIPT_NAME, TickWatch);
+        vm->RegisterFunction("SetWatchedHorses", SCRIPT_NAME, SetWatchedHorses);
         return true;
     }
 
