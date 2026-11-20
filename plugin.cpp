@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 40;
+    constexpr std::int32_t INTERFACE_VERSION = 41;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -161,6 +161,13 @@ namespace Companion {
     constexpr std::int32_t ITEM_KIND_OTHER_ARMOR = 27;
     // What GetHandCastState returns for a character that cannot cast
     constexpr std::int32_t CAST_STATE_UNKNOWN = -1;
+    // What GetAttackActionResult returns: the action has not been carried out yet, the game refused it, the game
+    // took it
+    constexpr std::int32_t ACTION_RESULT_PENDING = -1;
+    constexpr std::int32_t ACTION_RESULT_REFUSED = 0;
+    constexpr std::int32_t ACTION_RESULT_TAKEN = 1;
+    // What GetAttackState returns for a character whose state cannot be read
+    constexpr std::int32_t ATTACK_STATE_UNKNOWN = -1;
     constexpr std::int32_t DEFAULT_THING_RADIUS_METERS = 10;
     // Tables are no furniture for the game: they are scenery without a name. They are told by the file name of their
     // model, which holds this word (eg nobletablelong01.nif, commontablesquare01.nif) ...
@@ -4017,16 +4024,17 @@ namespace Companion {
     }
 
     // Makes a character do one of the actions of the game (as pressing or letting go of the attack button does for
-    // the player). Only call this on the main thread of the game
-    void DoAction(RE::Actor* actor, RE::DEFAULT_OBJECT actionID) {
+    // the player). Returns what the game said to the action (false also if it could not be asked).
+    // Only call this on the main thread of the game
+    bool DoAction(RE::Actor* actor, RE::DEFAULT_OBJECT actionID) {
         const auto* defaults = RE::BGSDefaultObjectManager::GetSingleton();
         auto* action = defaults ? defaults->GetObject<RE::BGSAction>(actionID) : nullptr;
-        if (!actor || !action) return;
+        if (!actor || !action) return false;
         std::unique_ptr<RE::TESActionData> data(RE::TESActionData::Create());
-        if (!data) return;
+        if (!data) return false;
         data->source = RE::NiPointer<RE::TESObjectREFR>(actor);
         data->action = action;
-        data->Process();
+        return data->Process();
     }
 
     // Casting by hand: a spell cast by a script (Spell.Cast) has no movement and comes out of the head of the
@@ -4058,6 +4066,47 @@ namespace Companion {
             if (casting) DoAction(casting.get(), RE::DEFAULT_OBJECT::kActionRightRelease);
         });
         return true;
+    }
+
+    // What the game said to the last action of StartAttack or EndAttack (see GetAttackActionResult)
+    std::atomic<std::int32_t> attackActionResult{ ACTION_RESULT_PENDING };
+
+    // Hands one of the two actions of the attack button to the game for a character and keeps what the game said to
+    // it. Returns whether it could be handed over. It runs a moment later, on the main thread
+    bool QueueAttackAction(RE::Actor* actor, RE::DEFAULT_OBJECT actionID) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!actor || !tasks) return false;
+        const auto handle = actor->GetHandle();
+        attackActionResult = ACTION_RESULT_PENDING;
+        tasks->AddTask([handle, actionID]() {
+            const auto attacker = handle.get();
+            const bool isTaken = attacker && DoAction(attacker.get(), actionID);
+            attackActionResult = isTaken ? ACTION_RESULT_TAKEN : ACTION_RESULT_REFUSED;
+        });
+        return true;
+    }
+
+    // Pressing the attack button for a character, whatever it holds: with a bow in its hands the game draws it.
+    // Other than StartHandCast this asks for no spell in the hand, and what the game said to the action is kept
+    bool StartAttack(RE::StaticFunctionTag*, RE::Actor* actor) {
+        return QueueAttackAction(actor, RE::DEFAULT_OBJECT::kActionRightAttack);
+    }
+
+    // Letting go of the attack button: a drawn bow lets its arrow fly
+    bool EndAttack(RE::StaticFunctionTag*, RE::Actor* actor) {
+        return QueueAttackAction(actor, RE::DEFAULT_OBJECT::kActionRightRelease);
+    }
+
+    // What the game said to the last action of StartAttack or EndAttack: 1 = it took it, 0 = it refused it,
+    // -1 = the action has not been carried out yet
+    std::int32_t GetAttackActionResult(RE::StaticFunctionTag*) { return attackActionResult.load(); }
+
+    // How far a character is with an attack, as the game numbers it: 0 = it does nothing, 1 to 6 = a blow,
+    // 8 = it draws its bow, 9 = the arrow is on, 10 = the bow is drawn, 11 = it lets go, 12 = it has let go,
+    // 13 and 14 = after the shot. -1 = cannot tell
+    std::int32_t GetAttackState(RE::StaticFunctionTag*, RE::Actor* actor) {
+        const auto* state = actor ? actor->AsActorState() : nullptr;
+        return state ? static_cast<std::int32_t>(state->GetAttackState()) : ATTACK_STATE_UNKNOWN;
     }
 
     // How far the right hand of a character is with casting, as the game numbers it: 0 = it does nothing,
@@ -6086,6 +6135,10 @@ namespace Companion {
         vm->RegisterFunction("StartHandCast", SCRIPT_NAME, StartHandCast);
         vm->RegisterFunction("EndHandCast", SCRIPT_NAME, EndHandCast);
         vm->RegisterFunction("GetHandCastState", SCRIPT_NAME, GetHandCastState);
+        vm->RegisterFunction("StartAttack", SCRIPT_NAME, StartAttack);
+        vm->RegisterFunction("EndAttack", SCRIPT_NAME, EndAttack);
+        vm->RegisterFunction("GetAttackActionResult", SCRIPT_NAME, GetAttackActionResult);
+        vm->RegisterFunction("GetAttackState", SCRIPT_NAME, GetAttackState);
         vm->RegisterFunction("GetInventoryLines", SCRIPT_NAME, GetInventoryLines);
         vm->RegisterFunction("SetTalkTarget", SCRIPT_NAME, SetTalkTarget);
         vm->RegisterFunction("GetHealSpells", SCRIPT_NAME, GetHealSpells);
