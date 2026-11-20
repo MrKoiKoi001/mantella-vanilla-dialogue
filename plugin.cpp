@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 41;
+    constexpr std::int32_t INTERFACE_VERSION = 42;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -168,6 +168,15 @@ namespace Companion {
     constexpr std::int32_t ACTION_RESULT_TAKEN = 1;
     // What GetAttackState returns for a character whose state cannot be read
     constexpr std::int32_t ATTACK_STATE_UNKNOWN = -1;
+    // Arrows sent to a target (see SetArrowTarget): only an arrow of the shooter younger than this is turned, the
+    // arrow is sent at this share of the height of the target (its chest), and this many tries look for the arrow
+    // after the animation told that it was let go (the game may not have made it yet)
+    constexpr float ARROW_NEWEST_SECONDS = 1.0f;
+    constexpr float ARROW_TARGET_HEIGHT_SHARE = 0.7f;
+    constexpr std::int32_t ARROW_SEARCH_TRIES = 5;
+    // The events of the animation that come when an arrow is let go have this word in their name (BowRelease,
+    // arrowRelease and attackRelease in the behavior of a rider)
+    constexpr std::string_view ARROW_RELEASE_WORD = "release";
     constexpr std::int32_t DEFAULT_THING_RADIUS_METERS = 10;
     // Tables are no furniture for the game: they are scenery without a name. They are told by the file name of their
     // model, which holds this word (eg nobletablelong01.nif, commontablesquare01.nif) ...
@@ -4109,6 +4118,168 @@ namespace Companion {
         return state ? static_cast<std::int32_t>(state->GetAttackState()) : ATTACK_STATE_UNKNOWN;
     }
 
+    // Sending an arrow to a target. A character that is not the player and has no enemy in a fight shoots straight
+    // ahead: in a test the arrows of a rider hit the player in front of it instead of the target. So while a target
+    // is set for a shooter (SetArrowTarget), the plugin listens to the events of its animation. When one tells that
+    // an arrow was let go, it looks for the arrow among the flying projectiles of the game and turns it to the
+    // target: same speed, the way the target moves meanwhile taken in, the fall of the arrow made up for.
+    // How the game makes a projectile fall: its gravity (DATA of the projectile, 0.35 for arrows) times the gravity of
+    // the Havok world times the inverse world scale. Learned from the source of True Directional Movement (ersh1, only
+    // read), which also turns arrows by setting linearVelocity and angle right after the shot
+    std::mutex arrowLock;
+    RE::ActorHandle arrowShooter;
+    RE::ObjectRefHandle arrowTarget;
+    std::unordered_set<RE::FormID> aimedArrowIDs;
+    std::atomic<std::int32_t> aimedArrowCount{ 0 };
+
+    // How fast an arrow falls, in game units per second squared. 0 if that cannot be told
+    float GetArrowFall(RE::Projectile* arrow) {
+        auto* base = arrow->GetBaseObject();
+        const auto* projectileForm = base ? base->As<RE::BGSProjectile>() : nullptr;
+        auto* cell = arrow->GetParentCell();
+        auto* world = cell ? cell->GetbhkWorld() : nullptr;
+        auto* havokWorld = world ? world->GetWorld1() : nullptr;
+        if (!projectileForm || !havokWorld) return 0.0f;
+        alignas(16) float gravity[4];
+        _mm_store_ps(gravity, havokWorld->gravity.quad);
+        return projectileForm->data.gravity * -gravity[2] * RE::bhkWorld::GetWorldScaleInverse();
+    }
+
+    // Turns one arrow to the chest of the target. Returns whether it could
+    bool AimArrow(RE::Projectile* arrow, RE::TESObjectREFR* target) {
+        auto& flight = arrow->GetProjectileRuntimeData();
+        const float speed = flight.linearVelocity.Length();
+        if (speed <= 0.0f) return false;
+        const RE::NiPoint3 start = arrow->GetPosition();
+        RE::NiPoint3 goal = target->GetPosition();
+        goal.z += target->GetHeight() * ARROW_TARGET_HEIGHT_SHARE;
+        RE::NiPoint3 targetVelocity;
+        target->GetLinearVelocity(targetVelocity);
+        float seconds = (goal - start).Length() / speed;
+        if (seconds <= 0.0f) return false;
+        // Where the target will be when the arrow gets there
+        goal += targetVelocity * seconds;
+        const RE::NiPoint3 offset = goal - start;
+        seconds = offset.Length() / speed;
+        if (seconds <= 0.0f) return false;
+        RE::NiPoint3 velocity = offset / seconds;
+        velocity.z += 0.5f * GetArrowFall(arrow) * seconds;
+        flight.linearVelocity = velocity;
+        // The arrow points the way it flies: x = how steep (up is positive for projectiles), z = the heading
+        const float level = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+        arrow->data.angle.x = std::atan2(velocity.z, level);
+        float heading = std::atan2(velocity.x, velocity.y);
+        if (heading < 0.0f) heading += 2.0f * std::numbers::pi_v<float>;
+        arrow->data.angle.z = heading;
+        return true;
+    }
+
+    // Turns the young arrows of the shooter that were not turned yet. Only call this on the main thread of the game.
+    // Returns how many it turned
+    std::int32_t AimArrowsOf(RE::Actor* shooter, RE::TESObjectREFR* target) {
+        auto* manager = RE::Projectile::Manager::GetSingleton();
+        if (!manager) return 0;
+        std::vector<RE::NiPointer<RE::Projectile>> arrows;
+        {
+            RE::BSSpinLockGuard guard(manager->projectileLock);
+            for (const auto* list : { &manager->unlimited, &manager->limited, &manager->pending }) {
+                for (const auto& handle : *list) {
+                    auto projectile = handle.get();
+                    if (!projectile || projectile->GetFormType() != RE::FormType::ProjectileArrow) continue;
+                    const auto& flight = projectile->GetProjectileRuntimeData();
+                    if (flight.livingTime > ARROW_NEWEST_SECONDS || flight.shooter.get().get() != shooter) continue;
+                    arrows.push_back(projectile);
+                }
+            }
+        }
+        std::int32_t aimedCount = 0;
+        for (const auto& arrow : arrows) {
+            if (aimedArrowIDs.contains(arrow->GetFormID())) continue;
+            if (AimArrow(arrow.get(), target)) {
+                aimedArrowIDs.insert(arrow->GetFormID());
+                ++aimedCount;
+            }
+        }
+        return aimedCount;
+    }
+
+    // Looks for the arrow on the main thread, and again a few times if the game has not made it yet
+    void QueueArrowAim(std::int32_t triesLeft) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!tasks || triesLeft <= 0) return;
+        tasks->AddTask([triesLeft]() {
+            std::int32_t aimedCount = 0;
+            {
+                std::lock_guard guard(arrowLock);
+                const auto shooter = arrowShooter.get();
+                const auto target = arrowTarget.get();
+                if (!shooter || !target) return;
+                aimedCount = AimArrowsOf(shooter.get(), target.get());
+            }
+            if (aimedCount > 0) {
+                aimedArrowCount += aimedCount;
+            } else {
+                QueueArrowAim(triesLeft - 1);
+            }
+        });
+    }
+
+    // Hears the events of the animation of the shooter while a target is set
+    class ArrowAimSink : public RE::BSTEventSink<RE::BSAnimationGraphEvent> {
+    public:
+        static ArrowAimSink* GetSingleton() {
+            static ArrowAimSink sink;
+            return &sink;
+        }
+
+        RE::BSEventNotifyControl ProcessEvent(const RE::BSAnimationGraphEvent* event, RE::BSTEventSource<RE::BSAnimationGraphEvent>*) override {
+            if (event && ContainsWord(event->tag.c_str(), ARROW_RELEASE_WORD)) QueueArrowAim(ARROW_SEARCH_TRIES);
+            return RE::BSEventNotifyControl::kContinue;
+        }
+
+    private:
+        static bool ContainsWord(const char* text, std::string_view word) {
+            if (!text) return false;
+            const std::string_view tag(text);
+            if (tag.size() < word.size()) return false;
+            for (std::size_t start = 0; start + word.size() <= tag.size(); ++start) {
+                bool isSame = true;
+                for (std::size_t index = 0; index < word.size() && isSame; ++index) {
+                    isSame = std::tolower(static_cast<unsigned char>(tag[start + index])) == static_cast<unsigned char>(word[index]);
+                }
+                if (isSame) return true;
+            }
+            return false;
+        }
+    };
+
+    // Sets the target the arrows of the shooter are sent to (None = they fly as the game shoots them again) and
+    // counts the arrows sent from now on. Returns whether it could be handed to the game. It runs a moment later
+    bool SetArrowTarget(RE::StaticFunctionTag*, RE::Actor* shooter, RE::TESObjectREFR* target) {
+        const auto* tasks = SKSE::GetTaskInterface();
+        if (!shooter || !tasks) return false;
+        const auto shooterHandle = shooter->GetHandle();
+        const auto targetHandle = target ? target->GetHandle() : RE::ObjectRefHandle();
+        if (target) aimedArrowCount = 0;
+        tasks->AddTask([shooterHandle, targetHandle]() {
+            std::lock_guard guard(arrowLock);
+            if (const auto heardBefore = arrowShooter.get()) heardBefore->RemoveAnimationGraphEventSink(ArrowAimSink::GetSingleton());
+            arrowShooter = RE::ActorHandle();
+            arrowTarget = RE::ObjectRefHandle();
+            aimedArrowIDs.clear();
+            const auto newShooter = shooterHandle.get();
+            if (!newShooter || !targetHandle) return;
+            if (newShooter->AddAnimationGraphEventSink(ArrowAimSink::GetSingleton())) {
+                arrowShooter = shooterHandle;
+                arrowTarget = targetHandle;
+            }
+        });
+        return true;
+    }
+
+    // How many arrows were sent to the target since it was set
+    std::int32_t GetAimedArrowCount(RE::StaticFunctionTag*) { return aimedArrowCount.load(); }
+
     // How far the right hand of a character is with casting, as the game numbers it: 0 = it does nothing,
     // 5 = it charges the spell, 6 = it casts. -1 = cannot tell
     std::int32_t GetHandCastState(RE::StaticFunctionTag*, RE::Actor* actor) {
@@ -6139,6 +6310,8 @@ namespace Companion {
         vm->RegisterFunction("EndAttack", SCRIPT_NAME, EndAttack);
         vm->RegisterFunction("GetAttackActionResult", SCRIPT_NAME, GetAttackActionResult);
         vm->RegisterFunction("GetAttackState", SCRIPT_NAME, GetAttackState);
+        vm->RegisterFunction("SetArrowTarget", SCRIPT_NAME, SetArrowTarget);
+        vm->RegisterFunction("GetAimedArrowCount", SCRIPT_NAME, GetAimedArrowCount);
         vm->RegisterFunction("GetInventoryLines", SCRIPT_NAME, GetInventoryLines);
         vm->RegisterFunction("SetTalkTarget", SCRIPT_NAME, SetTalkTarget);
         vm->RegisterFunction("GetHealSpells", SCRIPT_NAME, GetHealSpells);
