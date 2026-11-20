@@ -1,8 +1,8 @@
 name: Build KI_MCP_Gefaehrte.dll
 
 on:
+  # Every push builds, on every branch
   push:
-    branches: [master]
   workflow_dispatch:
 
 jobs:
