@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 42;
+    constexpr std::int32_t INTERFACE_VERSION = 43;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -173,7 +173,13 @@ namespace Companion {
     // after the animation told that it was let go (the game may not have made it yet)
     constexpr float ARROW_NEWEST_SECONDS = 1.0f;
     constexpr float ARROW_TARGET_HEIGHT_SHARE = 0.7f;
-    constexpr std::int32_t ARROW_SEARCH_TRIES = 5;
+    // One try per frame of the game: 60 are about half a second at 120 frames per second, so that an arrow the game
+    // makes a little after the event of letting go is still found
+    constexpr std::int32_t ARROW_SEARCH_TRIES = 60;
+    // How long the notes about the aiming of one shot may grow (GetArrowAimNotes), and how many different names of
+    // events of the animation they keep
+    constexpr std::size_t ARROW_NOTES_MAX_LENGTH = 600;
+    constexpr std::size_t ARROW_EVENT_TAGS_MAX = 16;
     // The events of the animation that come when an arrow is let go have this word in their name (BowRelease,
     // arrowRelease and attackRelease in the behavior of a rider)
     constexpr std::string_view ARROW_RELEASE_WORD = "release";
@@ -4131,6 +4137,26 @@ namespace Companion {
     RE::ObjectRefHandle arrowTarget;
     std::unordered_set<RE::FormID> aimedArrowIDs;
     std::atomic<std::int32_t> aimedArrowCount{ 0 };
+    // What the aiming saw since the target was set, for the notes of the builders of the mod (GetArrowAimNotes). It
+    // has its own lock: the events of the animation come while the game holds the lock of their source
+    std::mutex arrowNotesLock;
+    std::string arrowAimNotes;
+    std::vector<std::string> arrowEventTags;
+
+    void NoteArrowAim(const std::string& text) {
+        std::lock_guard guard(arrowNotesLock);
+        if (arrowAimNotes.size() > ARROW_NOTES_MAX_LENGTH) return;
+        if (!arrowAimNotes.empty()) arrowAimNotes += "; ";
+        arrowAimNotes += text;
+    }
+
+    void NoteArrowEvent(const char* tag) {
+        if (!tag) return;
+        std::lock_guard guard(arrowNotesLock);
+        if (arrowEventTags.size() >= ARROW_EVENT_TAGS_MAX) return;
+        if (std::find(arrowEventTags.begin(), arrowEventTags.end(), tag) != arrowEventTags.end()) return;
+        arrowEventTags.emplace_back(tag);
+    }
 
     // How fast an arrow falls, in game units per second squared. 0 if that cannot be told
     float GetArrowFall(RE::Projectile* arrow) {
@@ -4176,7 +4202,13 @@ namespace Companion {
 
     // Turns the young arrows of the shooter that were not turned yet. Only call this on the main thread of the game.
     // Returns how many it turned
-    std::int32_t AimArrowsOf(RE::Actor* shooter, RE::TESObjectREFR* target) {
+    // youngCount and ofShooterCount tell how many young arrows there were and how many of them the shooter shot,
+    // otherShooters the form IDs of the shooters of the others (for the notes of the builders)
+    std::int32_t AimArrowsOf(RE::Actor* shooter, RE::TESObjectREFR* target, std::int32_t& youngCount, std::int32_t& ofShooterCount,
+        std::string& otherShooters) {
+        youngCount = 0;
+        ofShooterCount = 0;
+        otherShooters.clear();
         auto* manager = RE::Projectile::Manager::GetSingleton();
         if (!manager) return 0;
         std::vector<RE::NiPointer<RE::Projectile>> arrows;
@@ -4187,7 +4219,15 @@ namespace Companion {
                     auto projectile = handle.get();
                     if (!projectile || projectile->GetFormType() != RE::FormType::ProjectileArrow) continue;
                     const auto& flight = projectile->GetProjectileRuntimeData();
-                    if (flight.livingTime > ARROW_NEWEST_SECONDS || flight.shooter.get().get() != shooter) continue;
+                    if (flight.livingTime > ARROW_NEWEST_SECONDS) continue;
+                    ++youngCount;
+                    const auto arrowShooterRef = flight.shooter.get();
+                    if (arrowShooterRef.get() != shooter) {
+                        if (!otherShooters.empty()) otherShooters += " ";
+                        otherShooters += arrowShooterRef ? std::format("{:08X}", arrowShooterRef->GetFormID()) : std::string("none");
+                        continue;
+                    }
+                    ++ofShooterCount;
                     arrows.push_back(projectile);
                 }
             }
@@ -4208,16 +4248,28 @@ namespace Companion {
         const auto* tasks = SKSE::GetTaskInterface();
         if (!tasks || triesLeft <= 0) return;
         tasks->AddTask([triesLeft]() {
+            const std::int32_t tryNumber = ARROW_SEARCH_TRIES - triesLeft + 1;
             std::int32_t aimedCount = 0;
+            std::int32_t youngCount = 0;
+            std::int32_t ofShooterCount = 0;
+            std::string otherShooters;
             {
                 std::lock_guard guard(arrowLock);
                 const auto shooter = arrowShooter.get();
                 const auto target = arrowTarget.get();
-                if (!shooter || !target) return;
-                aimedCount = AimArrowsOf(shooter.get(), target.get());
+                if (!shooter || !target) {
+                    NoteArrowAim(std::format("search {}: shooter or target gone", tryNumber));
+                    return;
+                }
+                aimedCount = AimArrowsOf(shooter.get(), target.get(), youngCount, ofShooterCount, otherShooters);
             }
             if (aimedCount > 0) {
                 aimedArrowCount += aimedCount;
+                NoteArrowAim(std::format("search {}: {} young arrows, {} of the shooter, {} turned", tryNumber, youngCount, ofShooterCount,
+                    aimedCount));
+            } else if (triesLeft <= 1) {
+                NoteArrowAim(std::format("nothing turned after {} searches: last {} young arrows, {} of the shooter{}", tryNumber,
+                    youngCount, ofShooterCount, otherShooters.empty() ? std::string() : ", others shot by " + otherShooters));
             } else {
                 QueueArrowAim(triesLeft - 1);
             }
@@ -4233,7 +4285,9 @@ namespace Companion {
         }
 
         RE::BSEventNotifyControl ProcessEvent(const RE::BSAnimationGraphEvent* event, RE::BSTEventSource<RE::BSAnimationGraphEvent>*) override {
-            if (event && ContainsWord(event->tag.c_str(), ARROW_RELEASE_WORD)) QueueArrowAim(ARROW_SEARCH_TRIES);
+            if (!event) return RE::BSEventNotifyControl::kContinue;
+            NoteArrowEvent(event->tag.c_str());
+            if (ContainsWord(event->tag.c_str(), ARROW_RELEASE_WORD)) QueueArrowAim(ARROW_SEARCH_TRIES);
             return RE::BSEventNotifyControl::kContinue;
         }
 
@@ -4260,7 +4314,12 @@ namespace Companion {
         if (!shooter || !tasks) return false;
         const auto shooterHandle = shooter->GetHandle();
         const auto targetHandle = target ? target->GetHandle() : RE::ObjectRefHandle();
-        if (target) aimedArrowCount = 0;
+        if (target) {
+            aimedArrowCount = 0;
+            std::lock_guard notesGuard(arrowNotesLock);
+            arrowAimNotes.clear();
+            arrowEventTags.clear();
+        }
         tasks->AddTask([shooterHandle, targetHandle]() {
             std::lock_guard guard(arrowLock);
             if (const auto heardBefore = arrowShooter.get()) heardBefore->RemoveAnimationGraphEventSink(ArrowAimSink::GetSingleton());
@@ -4272,6 +4331,9 @@ namespace Companion {
             if (newShooter->AddAnimationGraphEventSink(ArrowAimSink::GetSingleton())) {
                 arrowShooter = shooterHandle;
                 arrowTarget = targetHandle;
+                NoteArrowAim("listening to the animation");
+            } else {
+                NoteArrowAim("could not listen to the animation");
             }
         });
         return true;
@@ -4279,6 +4341,17 @@ namespace Companion {
 
     // How many arrows were sent to the target since it was set
     std::int32_t GetAimedArrowCount(RE::StaticFunctionTag*) { return aimedArrowCount.load(); }
+
+    // What the aiming saw since the target was set, for the notes of the builders of the mod: whether it could listen
+    // to the animation, the names of its events, and what the search for the arrow found
+    std::string GetArrowAimNotes(RE::StaticFunctionTag*) {
+        std::lock_guard guard(arrowNotesLock);
+        std::string notes = arrowAimNotes.empty() ? std::string("nothing noted") : arrowAimNotes;
+        notes += "; events:";
+        if (arrowEventTags.empty()) notes += " none";
+        for (const auto& tag : arrowEventTags) notes += " " + tag;
+        return notes;
+    }
 
     // How far the right hand of a character is with casting, as the game numbers it: 0 = it does nothing,
     // 5 = it charges the spell, 6 = it casts. -1 = cannot tell
@@ -6312,6 +6385,7 @@ namespace Companion {
         vm->RegisterFunction("GetAttackState", SCRIPT_NAME, GetAttackState);
         vm->RegisterFunction("SetArrowTarget", SCRIPT_NAME, SetArrowTarget);
         vm->RegisterFunction("GetAimedArrowCount", SCRIPT_NAME, GetAimedArrowCount);
+        vm->RegisterFunction("GetArrowAimNotes", SCRIPT_NAME, GetArrowAimNotes);
         vm->RegisterFunction("GetInventoryLines", SCRIPT_NAME, GetInventoryLines);
         vm->RegisterFunction("SetTalkTarget", SCRIPT_NAME, SetTalkTarget);
         vm->RegisterFunction("GetHealSpells", SCRIPT_NAME, GetHealSpells);
