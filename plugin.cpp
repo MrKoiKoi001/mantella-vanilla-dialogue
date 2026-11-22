@@ -42,7 +42,7 @@
 namespace Companion {
 
     // Goes up whenever the functions for the script change. The script passes it on to the companion server
-    constexpr std::int32_t INTERFACE_VERSION = 43;
+    constexpr std::int32_t INTERFACE_VERSION = 44;
     constexpr std::string_view SCRIPT_NAME = "KI_MCP_Gefaehrte_Native";
     // Stands between the parts of one quest line. CleanText makes sure that no text of the game contains it
     constexpr char FIELD_SEPARATOR = '\t';
@@ -4172,9 +4172,19 @@ namespace Companion {
     }
 
     // Turns one arrow to the chest of the target. Returns whether it could
-    bool AimArrow(RE::Projectile* arrow, RE::TESObjectREFR* target) {
+    // speedNotes tells the speed it read and the one it used (for the notes of the builders). In a test the arrow had
+    // the speed 0 when it was found: then the speed of its kind of projectile is taken, times its multiplier
+    bool AimArrow(RE::Projectile* arrow, RE::TESObjectREFR* target, std::string& speedNotes) {
         auto& flight = arrow->GetProjectileRuntimeData();
-        const float speed = flight.linearVelocity.Length();
+        const float readSpeed = flight.linearVelocity.Length();
+        float speed = readSpeed;
+        if (speed <= 0.0f) {
+            auto* base = arrow->GetBaseObject();
+            const auto* projectileForm = base ? base->As<RE::BGSProjectile>() : nullptr;
+            const float multiplier = flight.speedMult > 0.0f ? flight.speedMult : 1.0f;
+            speed = projectileForm ? projectileForm->data.speed * multiplier : 0.0f;
+        }
+        speedNotes = std::format("speed read {:.0f}, used {:.0f}", readSpeed, speed);
         if (speed <= 0.0f) return false;
         const RE::NiPoint3 start = arrow->GetPosition();
         RE::NiPoint3 goal = target->GetPosition();
@@ -4205,10 +4215,11 @@ namespace Companion {
     // youngCount and ofShooterCount tell how many young arrows there were and how many of them the shooter shot,
     // otherShooters the form IDs of the shooters of the others (for the notes of the builders)
     std::int32_t AimArrowsOf(RE::Actor* shooter, RE::TESObjectREFR* target, std::int32_t& youngCount, std::int32_t& ofShooterCount,
-        std::string& otherShooters) {
+        std::string& otherShooters, std::string& speedNotes) {
         youngCount = 0;
         ofShooterCount = 0;
         otherShooters.clear();
+        speedNotes.clear();
         auto* manager = RE::Projectile::Manager::GetSingleton();
         if (!manager) return 0;
         std::vector<RE::NiPointer<RE::Projectile>> arrows;
@@ -4235,7 +4246,7 @@ namespace Companion {
         std::int32_t aimedCount = 0;
         for (const auto& arrow : arrows) {
             if (aimedArrowIDs.contains(arrow->GetFormID())) continue;
-            if (AimArrow(arrow.get(), target)) {
+            if (AimArrow(arrow.get(), target, speedNotes)) {
                 aimedArrowIDs.insert(arrow->GetFormID());
                 ++aimedCount;
             }
@@ -4253,6 +4264,7 @@ namespace Companion {
             std::int32_t youngCount = 0;
             std::int32_t ofShooterCount = 0;
             std::string otherShooters;
+            std::string speedNotes;
             {
                 std::lock_guard guard(arrowLock);
                 const auto shooter = arrowShooter.get();
@@ -4261,15 +4273,16 @@ namespace Companion {
                     NoteArrowAim(std::format("search {}: shooter or target gone", tryNumber));
                     return;
                 }
-                aimedCount = AimArrowsOf(shooter.get(), target.get(), youngCount, ofShooterCount, otherShooters);
+                aimedCount = AimArrowsOf(shooter.get(), target.get(), youngCount, ofShooterCount, otherShooters, speedNotes);
             }
             if (aimedCount > 0) {
                 aimedArrowCount += aimedCount;
-                NoteArrowAim(std::format("search {}: {} young arrows, {} of the shooter, {} turned", tryNumber, youngCount, ofShooterCount,
-                    aimedCount));
+                NoteArrowAim(std::format("search {}: {} young arrows, {} of the shooter, {} turned ({})", tryNumber, youngCount,
+                    ofShooterCount, aimedCount, speedNotes));
             } else if (triesLeft <= 1) {
-                NoteArrowAim(std::format("nothing turned after {} searches: last {} young arrows, {} of the shooter{}", tryNumber,
-                    youngCount, ofShooterCount, otherShooters.empty() ? std::string() : ", others shot by " + otherShooters));
+                NoteArrowAim(std::format("nothing turned after {} searches: last {} young arrows, {} of the shooter{}{}", tryNumber,
+                    youngCount, ofShooterCount, otherShooters.empty() ? std::string() : ", others shot by " + otherShooters,
+                    speedNotes.empty() ? std::string() : " (" + speedNotes + ")"));
             } else {
                 QueueArrowAim(triesLeft - 1);
             }
